@@ -5,7 +5,7 @@
 # Configures a fresh Ubuntu 22.04 server for Tempo Insights deployment
 # 
 # Usage: 
-#   wget https://raw.githubusercontent.com/rrainey/tempo-insights/main/scripts/configure-instance.sh
+#   wget https://raw.githubusercontent.com/rrainey/tempo/refs/heads/main/desktop/tempo-insights/scripts/configure-instance.sh
 #   chmod +x configure-instance.sh
 #   sudo ./configure-instance.sh
 #
