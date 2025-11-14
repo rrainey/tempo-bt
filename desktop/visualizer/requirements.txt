@@ -1,5 +1,0 @@
-pyglet<2
-numpy-quaternion
-PyQt5 
-pyserial 
-pywavefront
