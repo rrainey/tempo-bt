@@ -1,6 +1,6 @@
 # Tempo-BT
 
-Tempo-BT is the Bluetooth LE capable version of the Tempo skyding logger device.  It is based on the u-blox NORA-B106 SOC.
+Tempo-BT is the Bluetooth LE capable version of the Tempo skydiving logger device.  It is based on the u-blox NORA-B106 SOC.
 
 ### Sensors and Capabilities
 
