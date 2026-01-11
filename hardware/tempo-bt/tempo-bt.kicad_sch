@@ -68442,13 +68442,14 @@
 				(justify left bottom)
 			)
 		)
-		(property "Value" "CR1220"
+		(property "Value" "1056TR"
 			(at 102.87 36.83 0)
 			(effects
 				(font
 					(size 1.27 1.0795)
 				)
 				(justify left bottom)
+				(hide yes)
 			)
 		)
 		(property "Footprint" "peakick:CR1220-2"
@@ -68496,13 +68497,12 @@
 				(hide yes)
 			)
 		)
-		(property "NOTES" "BATT HOLDER"
-			(at 100.33 41.91 0)
+		(property "NOTES" "CR1220 Battery + Holder"
+			(at 105.918 41.656 0)
 			(effects
 				(font
 					(size 1.27 1.27)
 				)
-				(hide yes)
 			)
 		)
 		(property "PACKAGE" ""
