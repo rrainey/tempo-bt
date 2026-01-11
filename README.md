@@ -11,12 +11,12 @@ Tempo-BT is the Bluetooth LE capable version of the Tempo skydiving logger devic
 
 ## Directory Structure
 
-| Folder      | Description |
-| ----------- | ----------- |
-| hardware    | KiCad PCB projects (using KiCad 7)    |
-| hardware/tempo-bt |u-blox NORA-B106 Bluetooth SOC (Nordic nRF5340) + u-blox GNSS + IMU + Barometric sensor PCB |
-| enclosure    | 3D-printable enclosures (Fusion360 format) |
-| zephyr/tempo-bt-v1 | Nordic nRF Connect SDK (Zephyr) firmware |
+| Folder               | Description |
+| -------------------- | ----------- |
+| hardware             | KiCad PCB projects (using KiCad 7)    |
+| hardware/tempo-bt    |u-blox NORA-B106 Bluetooth SOC (Nordic nRF5340) + u-blox GNSS + IMU + Barometric sensor PCB |
+| enclosure            | 3D-printable enclosure and assembly instructions (Fusion360 format) |
+| zephyr/tempo-bt-v1   | Nordic nRF Connect SDK (Zephyr) firmware |
 
 ## Enclosure
 
