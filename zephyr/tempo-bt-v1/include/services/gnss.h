@@ -211,6 +211,26 @@ int gnss_init_skydiving(void);
  */
 void gnss_set_session_start_time(uint64_t start_us);
 
+/**
+ * @brief Check if GNSS has a valid position fix
+ *
+ * A valid fix requires fix_quality > 0 and at least 3 satellites.
+ * This is useful for UI indicators (e.g., LED status).
+ *
+ * @return true if GNSS has a valid position fix, false otherwise
+ */
+bool gnss_has_fix(void);
+
+/**
+ * @brief Check if system time has been set from GNSS
+ *
+ * Returns true once valid date/time has been received from GNSS
+ * and used to set the system clock.
+ *
+ * @return true if system time was set from GNSS, false otherwise
+ */
+bool gnss_time_is_set(void);
+
 #ifdef CONFIG_GNSS_TEST_MODE
 /**
  * @brief Test UBX communication with GNSS module

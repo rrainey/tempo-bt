@@ -135,9 +135,18 @@ static uint8_t uart_rx_buf2[GNSS_UART_BUFFER_SIZE];
 static uint8_t nmea_line_buf[GNSS_UART_BUFFER_SIZE];
 static size_t nmea_line_pos = 0;
 
-/* Ring buffer for UART RX */
-static uint8_t ring_buffer_mem[1024];
+/* Ring buffer for UART RX - sized for ~2 seconds of data at 9600 baud */
+static uint8_t ring_buffer_mem[2048];
 static struct ring_buf rx_ring_buf;
+
+/* Semaphore to signal GNSS thread when data is available */
+static struct k_sem rx_data_sem;
+
+/* Flag to indicate GNSS subsystem is initialized (thread waits on this) */
+static volatile bool gnss_initialized = false;
+
+/* Flag to indicate system time has been set from GNSS */
+static volatile bool gnss_time_set_flag = false;
 
 /* Add session start tracking */
 static uint64_t gnss_session_start_us = 0;
@@ -176,13 +185,15 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
     case UART_RX_RDY:
         /* Data ready, add to ring buffer */
         if (evt->data.rx.len > 0) {
-            int written = ring_buf_put(&rx_ring_buf, 
-                                      evt->data.rx.buf + evt->data.rx.offset, 
+            int written = ring_buf_put(&rx_ring_buf,
+                                      evt->data.rx.buf + evt->data.rx.offset,
                                       evt->data.rx.len);
             if (written < evt->data.rx.len) {
-                LOG_WRN("Ring buffer full, dropped %d bytes", 
+                LOG_WRN("Ring buffer full, dropped %d bytes",
                         evt->data.rx.len - written);
             }
+            /* Wake GNSS thread to process data */
+            k_sem_give(&rx_data_sem);
         }
         break;
         
@@ -892,15 +903,22 @@ static void gnss_thread(void *p1, void *p2, void *p3)
     ARG_UNUSED(p1);
     ARG_UNUSED(p2);
     ARG_UNUSED(p3);
-    
-    LOG_INF("GNSS thread started");
-    
+
+    LOG_INF("GNSS thread started, waiting for init...");
+
+    /* Wait for gnss_init() to complete before using any resources */
+    while (!gnss_initialized) {
+        k_msleep(10);
+    }
+
+    LOG_INF("GNSS thread running");
+
     while (1) {
-        /* Process any data in the ring buffer */
+        /* Wait for data to be available (with timeout for periodic checks) */
+        k_sem_take(&rx_data_sem, K_MSEC(100));
+
+        /* Process all available data in the ring buffer */
         process_uart_data();
-        
-        /* Sleep briefly to avoid busy-waiting */
-        k_msleep(5);  /* Reduced from 10ms to process faster */
     }
 }
 
@@ -1089,6 +1107,9 @@ int gnss_init(void)
     /* Initialize UBX parser */
     ubx_reset_parser();
 
+    /* Initialize RX data semaphore (used to wake GNSS thread) */
+    k_sem_init(&rx_data_sem, 0, 1);
+
     /* Initialize TX completion semaphore */
     k_sem_init(&uart_tx_state.done, 0, 1);
     uart_tx_state.result = 0;
@@ -1117,6 +1138,51 @@ int gnss_init(void)
 
     LOG_INF("GNSS initialized on %s at %d baud",
             uart_dev->name, cfg.baudrate);
+
+    /* Signal GNSS thread that initialization is complete */
+    gnss_initialized = true;
+
+    /* Give GNSS thread time to start processing before sending UBX commands */
+    k_msleep(50);
+
+    /* Re-enable required NMEA messages that were disabled in gnss_early_quiet() */
+    LOG_INF("Re-enabling NMEA messages...");
+
+    /*
+     * UBX-CFG-MSG format: class(1) + id(1) + rate[6](one per port)
+     * We set rate=1 for UART1 (port index 1) to enable output once per nav cycle
+     * Port order: DDC(I2C), UART1, UART2, USB, SPI, reserved
+     */
+
+    /* Enable GGA (0xF0 0x00) - position, fix quality, satellites */
+    static const uint8_t enable_gga[] = {0xF0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+    ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, enable_gga, sizeof(enable_gga));
+    if (ret < 0) {
+        LOG_WRN("Failed to enable GGA: %d", ret);
+    }
+
+    /* Enable RMC (0xF0 0x04) - time, date, position, velocity */
+    static const uint8_t enable_rmc[] = {0xF0, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+    ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, enable_rmc, sizeof(enable_rmc));
+    if (ret < 0) {
+        LOG_WRN("Failed to enable RMC: %d", ret);
+    }
+
+    /* Enable VTG (0xF0 0x05) - velocity/track */
+    static const uint8_t enable_vtg[] = {0xF0, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+    ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, enable_vtg, sizeof(enable_vtg));
+    if (ret < 0) {
+        LOG_WRN("Failed to enable VTG: %d", ret);
+    }
+
+    /* Enable GSA (0xF0 0x02) - DOP and active satellites */
+    static const uint8_t enable_gsa[] = {0xF0, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+    ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, enable_gsa, sizeof(enable_gsa));
+    if (ret < 0) {
+        LOG_WRN("Failed to enable GSA: %d", ret);
+    }
+
+    LOG_INF("NMEA messages re-enabled");
 
     return 0;
 }
@@ -1212,10 +1278,9 @@ static void update_system_time_from_fix(void)
     if (!current_fix.date_valid || !current_fix.time_valid) {
         return;  /* Need both valid date and time */
     }
-    
+
     /* Check if we've already set the time this session */
-    static bool time_set = false;
-    if (time_set) {
+    if (gnss_time_set_flag) {
         return;  /* Only set once per boot */
     }
     
@@ -1249,7 +1314,7 @@ static void update_system_time_from_fix(void)
     
     int ret = clock_settime(CLOCK_REALTIME, &ts);
     if (ret == 0) {
-        time_set = true;
+        gnss_time_set_flag = true;
         LOG_INF("System time set from GNSS: %04d-%02d-%02d %02d:%02d:%02d.%03d UTC",
                 current_fix.year, current_fix.month, current_fix.day,
                 current_fix.hours, current_fix.minutes, current_fix.seconds,
@@ -1673,6 +1738,33 @@ static uint64_t get_session_start_us(void)
 void gnss_set_session_start_time(uint64_t start_us)
 {
     gnss_session_start_us = start_us;
+}
+
+bool gnss_has_fix(void)
+{
+    bool has_fix = false;
+
+    k_mutex_lock(&fix_mutex, K_FOREVER);
+
+    /* Consider we have a fix if:
+     * - fix_quality > 0 (GPS or better)
+     * - At least 3 satellites (minimum for 2D fix)
+     * - Position is marked valid
+     */
+    if (current_fix.fix_quality > 0 &&
+        current_fix.num_satellites >= 3 &&
+        current_fix.position_valid) {
+        has_fix = true;
+    }
+
+    k_mutex_unlock(&fix_mutex);
+
+    return has_fix;
+}
+
+bool gnss_time_is_set(void)
+{
+    return gnss_time_set_flag;
 }
 
 #ifdef CONFIG_RTC

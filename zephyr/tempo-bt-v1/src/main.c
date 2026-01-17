@@ -55,7 +55,9 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
 static struct gpio_callback button0_cb_data;
 static struct k_work_delayable button0_work;
+static struct k_work button0_action_work;  /* For logger start/stop (can't run in ISR) */
 static int64_t button0_press_time;
+static bool button0_pending_start;  /* true = start, false = stop */
 #endif
 
 #if DT_NODE_HAS_STATUS(SW1_NODE, okay)
@@ -67,15 +69,15 @@ static struct gpio_callback button1_cb_data;
 static void button0_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
-    
+
     /* Check if button is still pressed */
     int val = gpio_pin_get_dt(&button0);
     if (val == 1) { /* Active low, so 1 means pressed */
         int64_t press_duration = k_uptime_get() - button0_press_time;
-        
+
         if (press_duration >= BUTTON_LONG_PRESS_MS) {
             LOG_INF("Button 0 long press detected");
-            
+
             /* Toggle between idle and armed states */
             logger_state_t state = logger_get_state();
             if (state == LOGGER_STATE_IDLE) {
@@ -84,6 +86,18 @@ static void button0_work_handler(struct k_work *work)
                 logger_disarm();
             }
         }
+    }
+}
+
+/* Button action work handler - runs logger start/stop outside ISR context */
+static void button0_action_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (button0_pending_start) {
+        logger_start();
+    } else {
+        logger_stop();
     }
 }
 
@@ -107,22 +121,26 @@ static void button0_released(const struct device *dev, struct gpio_callback *cb,
     ARG_UNUSED(dev);
     ARG_UNUSED(cb);
     ARG_UNUSED(pins);
-    
+
     /* Cancel long press detection */
     k_work_cancel_delayable(&button0_work);
-    
+
     int64_t press_duration = k_uptime_get() - button0_press_time;
-    
-    if (press_duration < BUTTON_LONG_PRESS_MS && 
+
+    if (press_duration < BUTTON_LONG_PRESS_MS &&
         press_duration > BUTTON_DEBOUNCE_DELAY_MS) {
         LOG_INF("Button 0 short press detected");
-        
-        /* Short press: start/stop logging */
+
+        /* Short press: start/stop logging
+         * NOTE: Must defer to work queue - logger_start() does file I/O
+         * which requires significant stack space not available in ISR context */
         logger_state_t state = logger_get_state();
         if (state == LOGGER_STATE_ARMED) {
-            logger_start();
+            button0_pending_start = true;
+            k_work_submit(&button0_action_work);
         } else if (state == LOGGER_STATE_LOGGING) {
-            logger_stop();
+            button0_pending_start = false;
+            k_work_submit(&button0_action_work);
         }
     }
 }
@@ -183,8 +201,9 @@ int buttons_init(void)
     }
     
     k_work_init_delayable(&button0_work, button0_work_handler);
-    
-    gpio_init_callback(&button0_cb_data, 
+    k_work_init(&button0_action_work, button0_action_handler);
+
+    gpio_init_callback(&button0_cb_data,
                        button0_isr,
                        BIT(button0.pin));
     
@@ -224,27 +243,33 @@ static void update_led_for_state(logger_state_t state)
     switch (state) {
     case LOGGER_STATE_IDLE:
         /* Blue slow blink for idle */
-        set_color_led_state(RGB_BLUE, true);
-        LOG_INF("LED: Blue (idle)");
-        break;
-        
-    case LOGGER_STATE_ARMED:
-        /* Green slow blink for armed */
         set_color_led_state(RGB_ORANGE, true);
-        LOG_INF("LED: Green (armed)");
+        LOG_INF("LED: Orange (idle)");
         break;
-        
+
+    case LOGGER_STATE_ARMED:
+        /* Orange slow blink for armed */
+        set_color_led_state(RGB_BLUE, true);
+        LOG_INF("LED: Blue (armed)");
+        break;
+
     case LOGGER_STATE_LOGGING:
-        /* Red slow blink for logging */
+        /* Green slow blink for logging (climbing) */
         set_color_led_state(RGB_GREEN, true);
-        LOG_INF("LED: Red (logging)");
+        LOG_INF("LED: Green (logging)");
         break;
-        
+
+    case LOGGER_STATE_JUMPED:
+        /* Cyan slow blink for active jump (freefall/canopy) */
+        set_color_led_state(RGB_CYAN, true);
+        LOG_INF("LED: Cyan (jumped)");
+        break;
+
     case LOGGER_STATE_ERROR:
     default:
-        /* Orange slow blink for error */
+        /* Red slow blink for error */
         set_color_led_state(RGB_RED, true);
-        LOG_INF("LED: Orange (error)");
+        LOG_INF("LED: Red (error)");
         break;
     }
 }
@@ -643,23 +668,22 @@ int main(void)
     
     LOG_INF("System initialization complete");
 
-    indicate_system_ready();
+    /* Arm the logger automatically at startup for flight detection */
+    ret = logger_arm();
+    if (ret < 0) {
+        LOG_ERR("Failed to arm logger: %d", ret);
+        indicate_system_error("Logger arm failed");
+    } else {
+        LOG_INF("Logger armed - ready for automatic flight detection");
+        update_led_for_state(LOGGER_STATE_ARMED);
+    }
 
-    // Main thread idle loop
+    /* Main loop - call logger executive every 1 second */
     while (1) {
-        /* Log health status periodically */
-        k_sleep(K_SECONDS(30));
+        /* Logger executive manages automatic state transitions */
+        logger_executive();
 
-        //ret = gpio_pin_toggle_dt(&led);
-        
-#if 0
-        /* Get storage stats */
-        uint64_t free_bytes, total_bytes;
-        if (storage_get_free_space(&free_bytes, &total_bytes) == 0) {
-            LOG_INF("Storage: %llu MB free of %llu MB", 
-                    free_bytes / (1024*1024), total_bytes / (1024*1024));
-        }
-#endif
+        k_sleep(K_SECONDS(1));
     }
     
     return 0;

@@ -1,19 +1,29 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- * 
+ *
  * Tempo-BT V1 - RGB LED Service Implementation
- * 
- * Controls an RGB LED using PWM, providing a 50ms blink once per second
+ *
+ * Controls an RGB LED using PWM, providing a 50ms blink once per second.
+ * Also controls led1 (red GPIO LED) to indicate GPS lock status.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/drivers/pwm.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/device.h>
 
 #include "services/led.h"
+#include "services/gnss.h"
 
 LOG_MODULE_REGISTER(led_service, LOG_LEVEL_INF);
+
+/* GPIO LED for GPS status indicator (led1 = red LED) */
+#define GPS_LED_NODE DT_ALIAS(led1)
+#if DT_NODE_EXISTS(GPS_LED_NODE)
+static const struct gpio_dt_spec gps_led = GPIO_DT_SPEC_GET(GPS_LED_NODE, gpios);
+static bool gps_led_available = false;
+#endif
 
 /* PWM configuration */
 #define LED_PWM_NODE DT_NODELABEL(pwm0)
@@ -99,14 +109,21 @@ static int set_pwm_channel(uint32_t channel, uint8_t brightness)
 static void led_on(void)
 {
     k_mutex_lock(&led_state.mutex, K_FOREVER);
-    
+
     if (led_state.enabled) {
         set_pwm_channel(LED_PWM_CHANNEL_R, led_state.current_color.r >> 3);
         set_pwm_channel(LED_PWM_CHANNEL_G, led_state.current_color.g >> 3);
         set_pwm_channel(LED_PWM_CHANNEL_B, led_state.current_color.b >> 3);
         led_state.led_on = true;
+
+        /* Turn on GPS status LED (red) if no GPS fix */
+#if DT_NODE_EXISTS(GPS_LED_NODE)
+        if (gps_led_available && !gnss_has_fix()) {
+            gpio_pin_set_dt(&gps_led, 0);  /* Active low: 0 = LED on */
+        }
+#endif
     }
-    
+
     k_mutex_unlock(&led_state.mutex);
 }
 
@@ -116,12 +133,19 @@ static void led_on(void)
 static void led_off(void)
 {
     k_mutex_lock(&led_state.mutex, K_FOREVER);
-    
+
     set_pwm_channel(LED_PWM_CHANNEL_R, 0);
     set_pwm_channel(LED_PWM_CHANNEL_G, 0);
     set_pwm_channel(LED_PWM_CHANNEL_B, 0);
     led_state.led_on = false;
-    
+
+    /* Always turn off GPS status LED when RGB LED turns off */
+#if DT_NODE_EXISTS(GPS_LED_NODE)
+    if (gps_led_available) {
+        gpio_pin_set_dt(&gps_led, 1);  /* Active low: 1 = LED off */
+    }
+#endif
+
     k_mutex_unlock(&led_state.mutex);
 }
 
@@ -147,28 +171,42 @@ static void blink_timer_handler(struct k_timer *timer)
  */
 int led_service_init(void)
 {
-    
     /* Get PWM device */
     led_state.pwm_dev = DEVICE_DT_GET(LED_PWM_NODE);
     if (!device_is_ready(led_state.pwm_dev)) {
         LOG_ERR("PWM device not ready");
         return -ENODEV;
     }
-    
+
+    /* Initialize GPS status LED (led1 - red LED) */
+#if DT_NODE_EXISTS(GPS_LED_NODE)
+    if (gpio_is_ready_dt(&gps_led)) {
+        int gps_led_ret = gpio_pin_configure_dt(&gps_led, GPIO_OUTPUT_INACTIVE);
+        if (gps_led_ret == 0) {
+            gps_led_available = true;
+            LOG_INF("GPS status LED (led1) initialized");
+        } else {
+            LOG_WRN("Failed to configure GPS LED: %d", gps_led_ret);
+        }
+    } else {
+        LOG_WRN("GPS LED device not ready");
+    }
+#endif
+
     /* Initialize mutex */
     k_mutex_init(&led_state.mutex);
-    
+
     /* Initialize timer */
     k_timer_init(&led_state.blink_timer, blink_timer_handler, NULL);
 
     /* Initialize work item */
     k_work_init_delayable(&led_off_work, led_off_work_handler);
-    
+
     /* Turn off all channels initially */
     led_off();
-    
+
     LOG_INF("LED service initialized");
-    
+
     return 0;
 }
 

@@ -17,6 +17,7 @@ typedef enum {
     LOGGER_STATE_IDLE,
     LOGGER_STATE_ARMED,
     LOGGER_STATE_LOGGING,
+    LOGGER_STATE_JUMPED,      /* Active jump in progress (freefall/canopy) */
     LOGGER_STATE_POSTFLIGHT,
     LOGGER_STATE_ERROR
 } logger_state_t;
@@ -94,9 +95,21 @@ int logger_arm(void);
 
 /**
  * @brief Transition to idle state
- * 
+ *
  * @return 0 on success, negative error code on failure
  */
 int logger_disarm(void);
+
+/**
+ * @brief Logger executive function - manages automatic state transitions
+ *
+ * Call this function every 1 second from the main loop.
+ * Handles automatic transitions based on barometric rate of climb:
+ * - ARMED -> LOGGING on takeoff detection (climb > 200 ft/min)
+ * - LOGGING -> JUMPED on freefall detection (descent > 1000 ft/min)
+ * - JUMPED -> ARMED on landing detection (low activity for 60s)
+ * - LOGGING -> ARMED on abort (low activity for 360s, no jump)
+ */
+void logger_executive(void);
 
 #endif /* SERVICES_LOGGER_H */

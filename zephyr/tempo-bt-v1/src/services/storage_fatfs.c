@@ -165,9 +165,10 @@ static int create_directory_path(const char *full_path)
 {
     char path[MAX_PATH_LEN];
     char *p;
+    char *start;
     int ret;
 
-    LOG_INF("create directory path %s", full_path);
+    LOG_DBG("create directory path %s", full_path);
 
     /* Make a working copy */
     strncpy(path, full_path, sizeof(path) - 1);
@@ -182,12 +183,33 @@ static int create_directory_path(const char *full_path)
     /* Terminate at the last directory */
     *p = '\0';
 
-    /* Create each directory in the path */
-    p = path;
+    /* Skip the mount point prefix (e.g., "/SD:") - can't mkdir on mount point */
+    start = path;
+    if (strncmp(path, FATFS_MOUNT_POINT, strlen(FATFS_MOUNT_POINT)) == 0) {
+        start = path + strlen(FATFS_MOUNT_POINT);
+    }
+
+    /* If nothing after mount point, we're done */
+    if (*start == '\0') {
+        return 0;
+    }
+
+    /* Create each directory in the path, starting after mount point */
+    p = start;
     while ((p = strchr(p + 1, '/')) != NULL) {
+        struct fs_dirent entry;
+
         *p = '\0';
 
-        /* Try to create directory - ignore EEXIST */
+        /* Check if directory already exists */
+        ret = fs_stat(path, &entry);
+        if (ret == 0 && entry.type == FS_DIR_ENTRY_DIR) {
+            /* Directory exists, skip to next */
+            *p = '/';
+            continue;
+        }
+
+        /* Try to create directory */
         ret = fs_mkdir(path);
         if (ret != 0 && ret != -EEXIST) {
             LOG_ERR("Failed to create directory %s: %d", path, ret);
@@ -197,7 +219,14 @@ static int create_directory_path(const char *full_path)
         *p = '/';
     }
 
-    /* Create the final directory */
+    /* Create the final directory (check if it exists first) */
+    struct fs_dirent entry;
+    ret = fs_stat(path, &entry);
+    if (ret == 0 && entry.type == FS_DIR_ENTRY_DIR) {
+        /* Already exists */
+        return 0;
+    }
+
     ret = fs_mkdir(path);
     if (ret != 0 && ret != -EEXIST) {
         LOG_ERR("Failed to create directory %s: %d", path, ret);

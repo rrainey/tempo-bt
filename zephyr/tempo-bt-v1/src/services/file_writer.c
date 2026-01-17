@@ -24,7 +24,7 @@ LOG_MODULE_REGISTER(file_writer, LOG_LEVEL_INF);
 #define RING_BUFFER_SIZE        8192
 
 /* Thread configuration */
-#define WRITER_THREAD_STACK_SIZE 1024
+#define WRITER_THREAD_STACK_SIZE 2048  /* Increased from 1024 for FAT FS operations */
 #define WRITER_THREAD_PRIORITY   K_PRIO_PREEMPT(10)
 
 /* Static allocations */
