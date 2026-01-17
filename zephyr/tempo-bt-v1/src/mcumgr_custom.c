@@ -413,6 +413,7 @@ static int tempo_mgmt_logger_control(struct smp_streamer *ctxt)
         case LOGGER_STATE_IDLE:       state_str = "idle"; break;
         case LOGGER_STATE_ARMED:      state_str = "armed"; break;
         case LOGGER_STATE_LOGGING:    state_str = "logging"; break;
+        case LOGGER_STATE_JUMPED:    state_str = "jumped"; break;
         case LOGGER_STATE_POSTFLIGHT: state_str = "postflight"; break;
         case LOGGER_STATE_ERROR:      state_str = "error"; break;
     }

@@ -27,24 +27,16 @@ LOG_MODULE_REGISTER(aggregator, LOG_LEVEL_INF);
 static uint32_t last_nmea_arrival_ms = 0;
 
 /* Ring buffer sizes */
-#define IMU_RING_SIZE       128  /* 128 samples @ 400Hz = 320ms buffer */
 #define BARO_RING_SIZE      32   /* 32 samples @ 50Hz = 640ms buffer */
 #define GNSS_RING_SIZE      32   /* 32 fixes @ 10Hz = 3.2s buffer (increased for 10Hz) */
 
 /* Output timing */
-#define IMU_OUTPUT_PERIOD_MS    25   /* 40 Hz */
+#define IMU_OUTPUT_PERIOD_MS    20   /* 50 Hz */
 #define ENV_OUTPUT_PERIOD_MS    250  /* 4 Hz */
 
 char gps_date_string[14];
 
 /* Ring buffer structures */
-typedef struct {
-    imu_sample_t samples[IMU_RING_SIZE];
-    uint32_t head;
-    uint32_t tail;
-    struct k_spinlock lock;
-} imu_ring_t;
-
 typedef struct {
     baro_sample_t samples[BARO_RING_SIZE];
     uint32_t head;
@@ -60,12 +52,11 @@ typedef struct {
 } gnss_ring_t;
 
 /* Static data */
-static imu_ring_t imu_ring;
 static baro_ring_t baro_ring;
 static gnss_ring_t gnss_ring;
 
 static aggregator_config_t config = {
-    .imu_output_rate = 40,
+    .imu_output_rate = 50,
     .env_output_rate = 4,
     .gnss_output_rate = 1,
     .mag_output_rate = 0,
@@ -79,7 +70,6 @@ static aggregator_output_callback_t output_callback = NULL;
 
 /* Statistics */
 static struct {
-    uint32_t imu_count;
     uint32_t env_count;
     uint32_t gnss_count;
     uint32_t dropped_count;
@@ -96,9 +86,7 @@ static struct k_work_delayable imu_output_work;
 static struct k_work_delayable env_output_work;
 
 /* Latest samples for interpolation */
-static imu_sample_t last_imu_sample;
 static baro_sample_t last_baro_sample;
-static bool have_imu_sample = false;
 static bool have_baro_sample = false;
 
 /* Helper: Ring buffer push */
@@ -173,19 +161,6 @@ uint32_t log_get_timestamp_ms(uint64_t session_start_us)
 }
 
 /* Sensor callbacks */
-static void imu_data_callback(const imu_sample_t *samples, size_t count)
-{
-    for (size_t i = 0; i < count; i++) {
-        RING_PUSH(imu_ring, samples[i]);
-        last_imu_sample = samples[i];
-        have_imu_sample = true;
-        stats.imu_count++;
-        
-        /* Update orientation tracking */
-        orientation_update(&samples[i]);
-    }
-}
-
 static void baro_data_callback(const baro_sample_t *sample)
 {
     RING_PUSH(baro_ring, *sample);
@@ -287,30 +262,21 @@ void aggregator_write_version(void)
 static void imu_output_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
-    
-    if (!running || !output_callback || !have_imu_sample) {
+
+    if (!running || !output_callback) {
         goto reschedule;
     }
-    
+
+    /* Only output if orientation service is ready */
+    if (!orientation_is_ready()) {
+        goto reschedule;
+    }
+
     char line[LOG_MAX_SENTENCE_LEN];
     uint32_t timestamp_ms = log_get_timestamp_ms(config.session_start_us);
-    
-    /* Output IMU sentence using latest sample */
-    int len = log_format_sentence(line, sizeof(line),
-                                  "$PIMU,%u,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f",
-                                  timestamp_ms,
-                                  last_imu_sample.accel_x,
-                                  last_imu_sample.accel_y,
-                                  last_imu_sample.accel_z,
-                                  last_imu_sample.gyro_x,
-                                  last_imu_sample.gyro_y,
-                                  last_imu_sample.gyro_z);
-    
-    if (len > 0) {
-        output_callback(line, len);
-    }
-    
-    /* Output quaternion if enabled */
+    int len;
+
+    /* Output quaternion (orientation service now owns IMU data) */
     if (config.enable_quaternion) {
         orientation_quaternion_t quat;
         if (orientation_get_quaternion(&quat) == 0) {
@@ -328,7 +294,7 @@ static void imu_output_handler(struct k_work *work)
             output_callback(line, len);
         }
     }
-    
+
 reschedule:
     if (running) {
         k_work_reschedule(&imu_output_work, K_MSEC(IMU_OUTPUT_PERIOD_MS));
@@ -396,44 +362,41 @@ static void aggregator_thread_fn(void *p1, void *p2, void *p3)
 int aggregator_init(void)
 {
     LOG_INF("Initializing aggregator service");
-    
+
     /* Initialize ring buffers */
-    memset(&imu_ring, 0, sizeof(imu_ring));
     memset(&baro_ring, 0, sizeof(baro_ring));
     memset(&gnss_ring, 0, sizeof(gnss_ring));
-    
+
     /* Initialize work items */
     k_work_init_delayable(&imu_output_work, imu_output_handler);
     k_work_init_delayable(&env_output_work, env_output_handler);
-    
-    /* ADD THIS SECTION: Initialize orientation tracking */
+
+    /* Initialize orientation tracking (uses 200Hz IMU FIFO internally) */
     orientation_config_t orient_cfg = {
-        .gain = 2.5f,                    /* IMU-only mode gain */
-        .sample_period = 0.0025f,        /* 400Hz */
+        .gain = 0.5f,                    /* Fusion AHRS gain */
+        .sample_period = 0.005f,         /* 200Hz */
         .use_magnetometer = false,
         .acceleration_rejection = 10.0f,  /* 10 m/s² */
         .magnetic_rejection = 10.0f,
         .recovery_trigger_period = 5.0f
     };
-    
+
     int ret = orientation_init(&orient_cfg);
     if (ret < 0) {
         LOG_ERR("Failed to initialize orientation service: %d", ret);
         /* Not fatal - continue without quaternion output */
     }
-    /* END OF ADDED SECTION */
-    
-    /* Register sensor callbacks */
-    imu_register_callback(imu_data_callback);
+
+    /* Register sensor callbacks (IMU now handled by orientation service) */
     baro_register_callback(baro_data_callback);
     gnss_register_fix_callback(gnss_fix_callback);
     gnss_register_nmea_callback(nmea_passthrough_callback);
-    
+
     /* Reset statistics */
     memset(&stats, 0, sizeof(stats));
-    
+
     LOG_INF("Aggregator initialized");
-    
+
     return 0;
 }
 
@@ -461,20 +424,23 @@ int aggregator_start(void)
     if (running) {
         return -EALREADY;
     }
-    
+
     LOG_INF("Starting aggregator");
-    
+
     /* Set session start time if not already set */
     if (config.session_start_us == 0) {
         config.session_start_us = time_now_us();
     }
-    
+
     running = true;
-    
+
+    /* Note: Orientation service is started at boot and runs continuously.
+     * We just query it here - no need to start/stop it with logging. */
+
     /* Start output work items */
     k_work_schedule(&imu_output_work, K_MSEC(IMU_OUTPUT_PERIOD_MS));
     k_work_schedule(&env_output_work, K_MSEC(ENV_OUTPUT_PERIOD_MS));
-    
+
     /* Create aggregator thread */
     aggregator_tid = k_thread_create(&aggregator_thread,
                                      aggregator_stack,
@@ -483,7 +449,7 @@ int aggregator_start(void)
                                      NULL, NULL, NULL,
                                      K_PRIO_PREEMPT(5), 0, K_NO_WAIT);
     k_thread_name_set(aggregator_tid, "aggregator");
-    
+
     return 0;
 }
 
@@ -492,21 +458,24 @@ int aggregator_stop(void)
     if (!running) {
         return -EALREADY;
     }
-    
+
     LOG_INF("Stopping aggregator");
-    
+
     running = false;
-    
+
     /* Cancel work items */
     k_work_cancel_delayable(&imu_output_work);
     k_work_cancel_delayable(&env_output_work);
-    
+
+    /* Note: Orientation service keeps running - we don't stop it here.
+     * It maintains continuous orientation tracking across logging sessions. */
+
     /* Wait for thread to exit */
     if (aggregator_tid) {
         k_thread_join(aggregator_tid, K_FOREVER);
         aggregator_tid = NULL;
     }
-    
+
     return 0;
 }
 
@@ -593,7 +562,8 @@ int aggregator_set_gnss_rate(uint16_t rate_hz)
 void aggregator_get_stats(uint32_t *imu_count, uint32_t *env_count,
                           uint32_t *gnss_count, uint32_t *dropped_count)
 {
-    if (imu_count) *imu_count = stats.imu_count;
+    /* IMU count now comes from orientation service */
+    if (imu_count) *imu_count = orientation_get_sample_count();
     if (env_count) *env_count = stats.env_count;
     if (gnss_count) *gnss_count = stats.gnss_count;
     if (dropped_count) *dropped_count = stats.dropped_count;

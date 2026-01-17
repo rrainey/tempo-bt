@@ -220,7 +220,7 @@ flowchart TB
 * **Output sentences**:
   * `$PVER` - Version info at session start
   * `$PSFC` - Surface/ground altitude
-  * `$PIMU` - IMU data (40 Hz when IMU working)
+  * `$PIMU` - IMU data (50 Hz when IMU working)
   * `$PIM2` - Quaternion orientation (after each `$PIMU`)
   * `$PENV` - Environmental data (4 Hz) - pressure, altitude, battery
   * `$PTH` - Timestamp correlation (after GGA/GLL)
@@ -349,8 +349,8 @@ Uses **NMEA-style** `$Pxxx` proprietary sentences with checksums.
 |----------|------|-------------|
 | `$PVER` | Once | Version info: `"Tempo V1 <version> (<git>)",<numeric>` |
 | `$PSFC` | Once | Surface/ground altitude in feet |
-| `$PIMU` | 40 Hz | Accel (m/s²) + gyro (rad/s) - when IMU working |
-| `$PIM2` | 40 Hz | Quaternion (w,x,y,z) - after each PIMU |
+| `$PIMU` | 50 Hz | Accel (m/s²) + gyro (rad/s) - when IMU working |
+| `$PIM2` | 50 Hz | Quaternion (w,x,y,z) - after each PIMU |
 | `$PENV` | 4 Hz | Pressure (hPa), altitude (ft), battery (V) |
 | `$PTH` | Per fix | Timestamp correlation (ms since session start) |
 | `$PST` | Events | State change: old_state, new_state, trigger |

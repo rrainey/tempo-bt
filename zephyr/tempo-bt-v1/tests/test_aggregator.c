@@ -68,7 +68,7 @@ int test_aggregator(void)
     aggregator_register_output_callback(test_output_callback);
     
     /* Configure aggregator */
-    config.imu_output_rate = 40;     /* 40 Hz */
+    config.imu_output_rate = 50;     /* 50 Hz */
     config.env_output_rate = 4;      /* 4 Hz */
     config.gnss_output_rate = 1;     /* 1 Hz */
     config.mag_output_rate = 0;      /* Disabled */

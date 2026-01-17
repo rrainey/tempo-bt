@@ -75,7 +75,7 @@ static void orientation_test_imu_callback(const imu_sample_t *samples, size_t co
         test_state.sample_count++;
         
         /* Log quaternion data periodically */
-        if (test_state.log_quaternions && (test_state.sample_count % 40 == 0)) {
+        if (test_state.log_quaternions && (test_state.sample_count % 50 == 0)) {
             orientation_quaternion_t quat;
             orientation_get_quaternion(&quat);
             

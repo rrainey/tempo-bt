@@ -1,241 +1,527 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- * 
- * Tempo-BT V1 - IMU Service Implementation
+ *
+ * Tempo-BT V1 - IMU Service Implementation (FIFO-based)
+ *
+ * Uses the ICM42688 hardware FIFO for consistent sample timing.
+ * The orientation service polls imu_fifo_read() to drain samples.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/spi.h>
+#include <zephyr/sys/byteorder.h>
+
 #include "services/imu.h"
+#include "services/timebase.h"
 
 LOG_MODULE_REGISTER(imu_service, LOG_LEVEL_INF);
 
-static const struct device *imu_dev;
-static imu_data_callback_t data_callback;
+/*
+ * ICM42688 Register Definitions (subset needed for FIFO operation)
+ * These match the Zephyr driver's icm42688_reg.h
+ */
+#define REG_DEVICE_CONFIG       0x11
+#define REG_FIFO_CONFIG         0x16
+#define REG_INT_STATUS          0x2D
+#define REG_FIFO_COUNTH         0x2E
+#define REG_FIFO_COUNTL         0x2F
+#define REG_FIFO_DATA           0x30
+#define REG_SIGNAL_PATH_RESET   0x4B
+#define REG_PWR_MGMT0           0x4E
+#define REG_GYRO_CONFIG0        0x4F
+#define REG_ACCEL_CONFIG0       0x50
+#define REG_FIFO_CONFIG1        0x5F
+#define REG_FIFO_CONFIG2        0x60
+#define REG_FIFO_CONFIG3        0x61
+#define REG_WHO_AM_I            0x75
+
+/* Register bit definitions */
+#define BIT_SOFT_RESET          0x01
+#define BIT_FIFO_FLUSH          0x02
+
+/* FIFO_CONFIG mode bits */
+#define FIFO_MODE_BYPASS        0x00
+#define FIFO_MODE_STREAM        0x40
+
+/* FIFO_CONFIG1 bits */
+#define BIT_FIFO_TEMP_EN        0x04
+#define BIT_FIFO_GYRO_EN        0x02
+#define BIT_FIFO_ACCEL_EN       0x01
+
+/* PWR_MGMT0 bits */
+#define GYRO_MODE_LN            0x0C  /* Low-noise mode */
+#define ACCEL_MODE_LN           0x03  /* Low-noise mode */
+
+/* FIFO header bits */
+#define FIFO_HEADER_ACCEL       0x40
+#define FIFO_HEADER_GYRO        0x20
+#define FIFO_HEADER_EMPTY       0x80
+
+/* ODR values for ACCEL_CONFIG0 and GYRO_CONFIG0 */
+#define ODR_200HZ               0x09
+#define ODR_100HZ               0x08
+#define ODR_400HZ               0x07
+
+/* Full-scale values */
+#define ACCEL_FS_16G            0x00
+#define ACCEL_FS_8G             0x20
+#define ACCEL_FS_4G             0x40
+#define ACCEL_FS_2G             0x60
+
+#define GYRO_FS_2000DPS         0x00
+#define GYRO_FS_1000DPS         0x20
+#define GYRO_FS_500DPS          0x40
+#define GYRO_FS_250DPS          0x60
+
+/* Expected WHO_AM_I values */
+#define WHO_AM_I_ICM42688       0x47
+#define WHO_AM_I_ICM42688V      0xDB
+
+/* SPI read/write bit */
+#define SPI_READ_BIT            0x80
+
+/* FIFO packet size: header(1) + accel(6) + gyro(6) + temp(1) = 14 bytes
+ * Note: We use the simple 16-byte packet format without timestamp */
+#define FIFO_PACKET_SIZE        16
+
+/* Device state */
+static bool device_ready = false;
+static bool fifo_running = false;
+
 static imu_config_t current_config = {
-    .accel_odr_hz = 200,
-    .gyro_odr_hz = 200,
+    .odr_hz = 200,
     .accel_range_g = 16,
     .gyro_range_dps = 2000
 };
 
-K_THREAD_STACK_DEFINE(imu_thread_stack, 2048);
-static struct k_thread imu_thread_data;
-static k_tid_t imu_thread_id;
-static volatile bool running;
+/* Sensitivity values based on current config */
+static float accel_sensitivity;  /* LSB per m/s^2 */
+static float gyro_sensitivity;   /* LSB per rad/s */
 
-/* Optional trigger support */
-#ifdef CONFIG_ICM42688_TRIGGER
-static struct sensor_trigger data_ready_trigger = {
-    .type = SENSOR_TRIG_DATA_READY,
-    .chan = SENSOR_CHAN_ACCEL_XYZ,
-};
+/* Get device tree SPI specification */
+#define IMU_SPI_NODE DT_NODELABEL(icm42688)
 
-static void imu_trigger_handler(const struct device *dev,
-                               const struct sensor_trigger *trig)
-{
-    struct sensor_value accel[3], gyro[3], temp;
-    imu_sample_t sample;
-    
-    if (sensor_sample_fetch(dev) < 0) {
-        LOG_ERR("Sample fetch failed");
-        return;
-    }
-    
-    sensor_channel_get(dev, SENSOR_CHAN_ACCEL_XYZ, accel);
-    sensor_channel_get(dev, SENSOR_CHAN_GYRO_XYZ, gyro);
-    sensor_channel_get(dev, SENSOR_CHAN_DIE_TEMP, &temp);
-    
-    sample.timestamp_us = time_now_us();
-    sample.accel_x = sensor_value_to_float(&accel[0]);
-    sample.accel_y = sensor_value_to_float(&accel[1]);
-    sample.accel_z = sensor_value_to_float(&accel[2]);
-    sample.gyro_x = sensor_value_to_float(&gyro[0]);
-    sample.gyro_y = sensor_value_to_float(&gyro[1]);
-    sample.gyro_z = sensor_value_to_float(&gyro[2]);
-    sample.temperature = sensor_value_to_float(&temp);
-    
-    if (data_callback) {
-        data_callback(&sample, 1);
-    }
-}
+#if !DT_NODE_EXISTS(IMU_SPI_NODE)
+#error "ICM42688 device not found in device tree"
 #endif
 
-static void imu_thread_fn(void *p1, void *p2, void *p3)
+/* SPI device specification from device tree */
+static const struct spi_dt_spec spi_spec = SPI_DT_SPEC_GET(IMU_SPI_NODE,
+    SPI_WORD_SET(8) | SPI_TRANSFER_MSB | SPI_OP_MODE_MASTER, 0);
+
+/*
+ * Low-level SPI functions
+ */
+static int spi_write_reg(uint8_t reg, uint8_t value)
 {
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
-    
-    struct sensor_value accel[3], gyro[3], temp;
-    imu_sample_t sample;
-    uint32_t sleep_ms = 1000 / current_config.accel_odr_hz;
-    
-    LOG_INF("IMU polling thread started");
-    
-    while (running) {
-        if (sensor_sample_fetch(imu_dev) < 0) {
-            LOG_ERR("Sample fetch failed");
-            k_sleep(K_MSEC(sleep_ms));
-            continue;
-        }
-        
-        sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_XYZ, accel);
-        sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_XYZ, gyro);
-        sensor_channel_get(imu_dev, SENSOR_CHAN_DIE_TEMP, &temp);
-        
-        sample.timestamp_us = time_now_us();
-        sample.accel_x = sensor_value_to_float(&accel[0]);
-        sample.accel_y = sensor_value_to_float(&accel[1]);
-        sample.accel_z = sensor_value_to_float(&accel[2]);
-        sample.gyro_x = sensor_value_to_float(&gyro[0]);
-        sample.gyro_y = sensor_value_to_float(&gyro[1]);
-        sample.gyro_z = sensor_value_to_float(&gyro[2]);
-        sample.temperature = sensor_value_to_float(&temp);
-        
-        if (data_callback) {
-            data_callback(&sample, 1);
-        }
-        
-        k_sleep(K_MSEC(sleep_ms));
-    }
-    
-    LOG_INF("IMU polling thread stopped");
+    uint8_t tx_buf[2] = { reg & 0x7F, value };
+    struct spi_buf tx = { .buf = tx_buf, .len = 2 };
+    struct spi_buf_set tx_set = { .buffers = &tx, .count = 1 };
+
+    return spi_write_dt(&spi_spec, &tx_set);
 }
+
+static int spi_read_reg(uint8_t reg, uint8_t *value)
+{
+    uint8_t tx_buf[2] = { reg | SPI_READ_BIT, 0 };
+    uint8_t rx_buf[2] = { 0 };
+    struct spi_buf tx = { .buf = tx_buf, .len = 2 };
+    struct spi_buf rx = { .buf = rx_buf, .len = 2 };
+    struct spi_buf_set tx_set = { .buffers = &tx, .count = 1 };
+    struct spi_buf_set rx_set = { .buffers = &rx, .count = 1 };
+
+    int ret = spi_transceive_dt(&spi_spec, &tx_set, &rx_set);
+
+    if (ret == 0) {
+        *value = rx_buf[1];
+    }
+    return ret;
+}
+
+static int spi_read_burst(uint8_t reg, uint8_t *data, size_t len)
+{
+    uint8_t tx_buf = reg | SPI_READ_BIT;
+    struct spi_buf tx = { .buf = &tx_buf, .len = 1 };
+    struct spi_buf rx_bufs[2] = {
+        { .buf = &tx_buf, .len = 1 },  /* dummy for tx byte */
+        { .buf = data, .len = len }
+    };
+    struct spi_buf_set tx_set = { .buffers = &tx, .count = 1 };
+    struct spi_buf_set rx_set = { .buffers = rx_bufs, .count = 2 };
+
+    return spi_transceive_dt(&spi_spec, &tx_set, &rx_set);
+}
+
+/*
+ * Update sensitivity values based on current config
+ */
+static void update_sensitivity(void)
+{
+    /* Accelerometer sensitivity in LSB per g, then convert to LSB per m/s^2 */
+    switch (current_config.accel_range_g) {
+    case 2:  accel_sensitivity = 16384.0f / 9.80665f; break;
+    case 4:  accel_sensitivity = 8192.0f / 9.80665f; break;
+    case 8:  accel_sensitivity = 4096.0f / 9.80665f; break;
+    case 16: accel_sensitivity = 2048.0f / 9.80665f; break;
+    default: accel_sensitivity = 2048.0f / 9.80665f; break;
+    }
+
+    /* Gyroscope sensitivity in LSB per deg/s, then convert to LSB per rad/s */
+    switch (current_config.gyro_range_dps) {
+    case 250:  gyro_sensitivity = 131.0f * 57.2957795f; break;
+    case 500:  gyro_sensitivity = 65.5f * 57.2957795f; break;
+    case 1000: gyro_sensitivity = 32.8f * 57.2957795f; break;
+    case 2000: gyro_sensitivity = 16.4f * 57.2957795f; break;
+    default:   gyro_sensitivity = 16.4f * 57.2957795f; break;
+    }
+}
+
+/*
+ * Get ODR register value from Hz
+ */
+static uint8_t hz_to_odr_reg(uint16_t hz)
+{
+    if (hz >= 400) return 0x07;       /* 400 Hz */
+    if (hz >= 200) return 0x09;       /* 200 Hz */
+    if (hz >= 100) return 0x08;       /* 100 Hz */
+    if (hz >= 50)  return 0x0A;       /* 50 Hz */
+    return 0x09;                       /* Default 200 Hz */
+}
+
+/*
+ * Get full-scale register value for accelerometer
+ */
+static uint8_t accel_fs_to_reg(uint8_t g)
+{
+    if (g >= 16) return 0x00;
+    if (g >= 8)  return 0x20;
+    if (g >= 4)  return 0x40;
+    return 0x60;
+}
+
+/*
+ * Get full-scale register value for gyroscope
+ */
+static uint8_t gyro_fs_to_reg(uint16_t dps)
+{
+    if (dps >= 2000) return 0x00;
+    if (dps >= 1000) return 0x20;
+    if (dps >= 500)  return 0x40;
+    return 0x60;
+}
+
+/*
+ * Public API implementation
+ */
 
 int imu_init(void)
 {
-    LOG_INF("Initializing IMU service");
-    
-    //imu_dev = DEVICE_DT_GET(DT_ALIAS(imu0));
-    imu_dev = DEVICE_DT_GET_ONE(invensense_icm42688);
+    int ret;
+    uint8_t who_am_i;
 
-    extern int icm42688_init(const struct device *dev);
+    LOG_INF("Initializing IMU service (FIFO mode)");
 
-    icm42688_init(imu_dev);
-
-    if (!device_is_ready(imu_dev)) {
-        LOG_ERR("IMU device not ready");
+    /* Check if SPI bus is ready */
+    if (!spi_is_ready_dt(&spi_spec)) {
+        LOG_ERR("SPI bus device not ready");
         return -ENODEV;
     }
-    
-    LOG_INF("IMU device ready: %s", imu_dev->name);
-    
-#ifdef CONFIG_ICM42688_TRIGGER
-    /* Use interrupt-driven mode if available */
-    if (sensor_trigger_set(imu_dev, &data_ready_trigger, 
-                          imu_trigger_handler) < 0) {
-        LOG_WRN("Failed to set trigger, falling back to polling");
-    } else {
-        LOG_INF("Configured for interrupt mode");
+
+    /* Wait for device power-up */
+    k_msleep(3);
+
+    /* Soft reset */
+    ret = spi_write_reg(REG_DEVICE_CONFIG, BIT_SOFT_RESET);
+    if (ret) {
+        LOG_ERR("Failed to send soft reset: %d", ret);
+        return ret;
     }
-#endif
-    
+
+    /* Wait for reset to complete */
+    k_msleep(10);
+
+    /* Verify WHO_AM_I */
+    ret = spi_read_reg(REG_WHO_AM_I, &who_am_i);
+    if (ret) {
+        LOG_ERR("Failed to read WHO_AM_I: %d", ret);
+        return ret;
+    }
+
+    if (who_am_i != WHO_AM_I_ICM42688 && who_am_i != WHO_AM_I_ICM42688V) {
+        LOG_ERR("Invalid WHO_AM_I: 0x%02X (expected 0x47 or 0xDB)", who_am_i);
+        return -EINVAL;
+    }
+
+    LOG_INF("ICM42688 detected (WHO_AM_I=0x%02X)", who_am_i);
+
+    /* Apply default configuration */
+    update_sensitivity();
+
+    device_ready = true;
     return 0;
 }
 
 int imu_configure(const imu_config_t *config)
 {
-    struct sensor_value val;
     int ret;
-    
+    uint8_t accel_cfg, gyro_cfg;
+
+    if (!device_ready) {
+        return -ENODEV;
+    }
+
+    if (!config) {
+        return -EINVAL;
+    }
+
     current_config = *config;
-    
-    /* Set accelerometer range */
-    val.val1 = config->accel_range_g;
-    val.val2 = 0;
-    ret = sensor_attr_set(imu_dev, SENSOR_CHAN_ACCEL_XYZ,
-                         SENSOR_ATTR_FULL_SCALE, &val);
-    if (ret < 0) {
-        LOG_ERR("Failed to set accel range: %d", ret);
+    update_sensitivity();
+
+    /* Configure accelerometer: ODR + full-scale */
+    accel_cfg = hz_to_odr_reg(config->odr_hz) | accel_fs_to_reg(config->accel_range_g);
+    ret = spi_write_reg(REG_ACCEL_CONFIG0, accel_cfg);
+    if (ret) {
+        LOG_ERR("Failed to configure accelerometer: %d", ret);
         return ret;
     }
-    
-    /* Set gyroscope range */
-    val.val1 = config->gyro_range_dps;
-    val.val2 = 0;
-    ret = sensor_attr_set(imu_dev, SENSOR_CHAN_GYRO_XYZ,
-                         SENSOR_ATTR_FULL_SCALE, &val);
-    if (ret < 0) {
-        LOG_ERR("Failed to set gyro range: %d", ret);
+
+    /* Configure gyroscope: ODR + full-scale */
+    gyro_cfg = hz_to_odr_reg(config->odr_hz) | gyro_fs_to_reg(config->gyro_range_dps);
+    ret = spi_write_reg(REG_GYRO_CONFIG0, gyro_cfg);
+    if (ret) {
+        LOG_ERR("Failed to configure gyroscope: %d", ret);
         return ret;
     }
-    
-    /* Set sampling frequency */
-    val.val1 = config->accel_odr_hz;
-    val.val2 = 0;
-    ret = sensor_attr_set(imu_dev, SENSOR_CHAN_ACCEL_XYZ,
-                         SENSOR_ATTR_SAMPLING_FREQUENCY, &val);
-    if (ret < 0) {
-        LOG_ERR("Failed to set accel ODR: %d", ret);
-        return ret;
-    }
-    
-    ret = sensor_attr_set(imu_dev, SENSOR_CHAN_GYRO_XYZ,
-                         SENSOR_ATTR_SAMPLING_FREQUENCY, &val);
-    if (ret < 0) {
-        LOG_ERR("Failed to set gyro ODR: %d", ret);
-        return ret;
-    }
-    
-    LOG_INF("IMU configured: %dHz, %dg, %ddps",
-            config->accel_odr_hz, config->accel_range_g, 
-            config->gyro_range_dps);
-    
+
+    LOG_INF("IMU configured: %d Hz, %dg, %d dps",
+            config->odr_hz, config->accel_range_g, config->gyro_range_dps);
+
     return 0;
 }
 
-void imu_register_callback(imu_data_callback_t callback)
+int imu_fifo_start(void)
 {
-    data_callback = callback;
-}
+    int ret;
 
-int imu_start(void)
-{
-    if (running) {
-        return -EALREADY;
+    if (!device_ready) {
+        return -ENODEV;
     }
-    
-    LOG_INF("Starting IMU data collection");
-    running = true;
-    
-#ifndef CONFIG_ICM42688_TRIGGER
-    /* Start polling thread if not using interrupts */
-    imu_thread_id = k_thread_create(&imu_thread_data,
-                                   imu_thread_stack,
-                                   K_THREAD_STACK_SIZEOF(imu_thread_stack),
-                                   imu_thread_fn,
-                                   NULL, NULL, NULL,
-                                   K_PRIO_PREEMPT(5), 0, K_NO_WAIT);
-    k_thread_name_set(imu_thread_id, "imu_poll");
-#endif
-    
+
+    if (fifo_running) {
+        return 0;  /* Already running */
+    }
+
+    LOG_INF("Starting IMU FIFO");
+
+    /* Enable gyro and accel in low-noise mode */
+    ret = spi_write_reg(REG_PWR_MGMT0, GYRO_MODE_LN | ACCEL_MODE_LN);
+    if (ret) {
+        LOG_ERR("Failed to set power mode: %d", ret);
+        return ret;
+    }
+
+    /* Wait for sensors to start */
+    k_msleep(50);
+
+    /* Apply configuration */
+    ret = imu_configure(&current_config);
+    if (ret) {
+        return ret;
+    }
+
+    /* Configure FIFO: enable accel, gyro, temp */
+    ret = spi_write_reg(REG_FIFO_CONFIG1, BIT_FIFO_ACCEL_EN | BIT_FIFO_GYRO_EN | BIT_FIFO_TEMP_EN);
+    if (ret) {
+        LOG_ERR("Failed to configure FIFO content: %d", ret);
+        return ret;
+    }
+
+    /* Flush FIFO before starting */
+    ret = spi_write_reg(REG_SIGNAL_PATH_RESET, BIT_FIFO_FLUSH);
+    if (ret) {
+        LOG_ERR("Failed to flush FIFO: %d", ret);
+        return ret;
+    }
+
+    k_msleep(1);
+
+    /* Enable FIFO in stream mode */
+    ret = spi_write_reg(REG_FIFO_CONFIG, FIFO_MODE_STREAM);
+    if (ret) {
+        LOG_ERR("Failed to enable FIFO stream: %d", ret);
+        return ret;
+    }
+
+    fifo_running = true;
+    LOG_INF("IMU FIFO started");
+
     return 0;
 }
 
-int imu_stop(void)
+int imu_fifo_stop(void)
 {
-    if (!running) {
-        return -EALREADY;
+    int ret;
+
+    if (!device_ready) {
+        return -ENODEV;
     }
-    
-    LOG_INF("Stopping IMU data collection");
-    running = false;
-    
-#ifndef CONFIG_ICM42688_TRIGGER
-    if (imu_thread_id) {
-        k_thread_join(imu_thread_id, K_FOREVER);
-        imu_thread_id = NULL;
+
+    if (!fifo_running) {
+        return 0;
     }
-#endif
-    
+
+    LOG_INF("Stopping IMU FIFO");
+
+    /* Set FIFO to bypass mode */
+    ret = spi_write_reg(REG_FIFO_CONFIG, FIFO_MODE_BYPASS);
+    if (ret) {
+        LOG_ERR("Failed to disable FIFO: %d", ret);
+        return ret;
+    }
+
+    /* Flush FIFO */
+    ret = spi_write_reg(REG_SIGNAL_PATH_RESET, BIT_FIFO_FLUSH);
+    if (ret) {
+        LOG_ERR("Failed to flush FIFO: %d", ret);
+        return ret;
+    }
+
+    fifo_running = false;
+    LOG_INF("IMU FIFO stopped");
+
     return 0;
+}
+
+int imu_fifo_read(imu_sample_t *samples, size_t max_count)
+{
+    int ret;
+    uint8_t count_buf[2];
+    uint16_t fifo_count;
+    size_t packets_to_read;
+    static uint8_t fifo_buf[FIFO_PACKET_SIZE * 16];  /* Read up to 16 packets at once */
+    uint64_t now_us;
+
+    if (!device_ready || !fifo_running) {
+        return -ENODEV;
+    }
+
+    if (!samples || max_count == 0) {
+        return -EINVAL;
+    }
+
+    /* Read FIFO count (2 bytes, big-endian) */
+    ret = spi_read_burst(REG_FIFO_COUNTH, count_buf, 2);
+    if (ret) {
+        LOG_ERR("Failed to read FIFO count: %d", ret);
+        return ret;
+    }
+
+    fifo_count = (count_buf[0] << 8) | count_buf[1];
+
+    if (fifo_count == 0) {
+        return 0;  /* No data available */
+    }
+
+    /* Calculate number of complete packets */
+    packets_to_read = fifo_count / FIFO_PACKET_SIZE;
+    if (packets_to_read == 0) {
+        return 0;  /* Not enough data for a complete packet */
+    }
+
+    /* Limit to max_count and buffer size */
+    if (packets_to_read > max_count) {
+        packets_to_read = max_count;
+    }
+    if (packets_to_read > 16) {
+        packets_to_read = 16;
+    }
+
+    /* Read FIFO data */
+    ret = spi_read_burst(REG_FIFO_DATA, fifo_buf, packets_to_read * FIFO_PACKET_SIZE);
+    if (ret) {
+        LOG_ERR("Failed to read FIFO data: %d", ret);
+        return ret;
+    }
+
+    /* Get current time for timestamping */
+    now_us = time_now_us();
+
+    /* Parse packets
+     * Packet format (16 bytes):
+     * [0]    Header
+     * [1-2]  Accel X (big-endian, signed)
+     * [3-4]  Accel Y
+     * [5-6]  Accel Z
+     * [7-8]  Gyro X
+     * [9-10] Gyro Y
+     * [11-12] Gyro Z
+     * [13]   Temperature (8-bit)
+     * [14-15] Timestamp (not used in basic mode)
+     */
+    size_t valid_count = 0;
+    uint64_t sample_period_us = 1000000 / current_config.odr_hz;
+
+    for (size_t i = 0; i < packets_to_read; i++) {
+        uint8_t *pkt = &fifo_buf[i * FIFO_PACKET_SIZE];
+        uint8_t header = pkt[0];
+
+        /* Check for empty packet marker */
+        if (header & FIFO_HEADER_EMPTY) {
+            continue;
+        }
+
+        /* Only process packets with both accel and gyro data */
+        if ((header & (FIFO_HEADER_ACCEL | FIFO_HEADER_GYRO)) !=
+            (FIFO_HEADER_ACCEL | FIFO_HEADER_GYRO)) {
+            continue;
+        }
+
+        /* Parse raw values (big-endian, signed 16-bit) */
+        int16_t accel_x = (int16_t)((pkt[1] << 8) | pkt[2]);
+        int16_t accel_y = (int16_t)((pkt[3] << 8) | pkt[4]);
+        int16_t accel_z = (int16_t)((pkt[5] << 8) | pkt[6]);
+        int16_t gyro_x  = (int16_t)((pkt[7] << 8) | pkt[8]);
+        int16_t gyro_y  = (int16_t)((pkt[9] << 8) | pkt[10]);
+        int16_t gyro_z  = (int16_t)((pkt[11] << 8) | pkt[12]);
+        int8_t temp_raw = (int8_t)pkt[13];
+
+        /* Convert to physical units */
+        samples[valid_count].accel_x = (float)accel_x / accel_sensitivity;
+        samples[valid_count].accel_y = (float)accel_y / accel_sensitivity;
+        samples[valid_count].accel_z = (float)accel_z / accel_sensitivity;
+        samples[valid_count].gyro_x  = (float)gyro_x / gyro_sensitivity;
+        samples[valid_count].gyro_y  = (float)gyro_y / gyro_sensitivity;
+        samples[valid_count].gyro_z  = (float)gyro_z / gyro_sensitivity;
+        samples[valid_count].temperature = 25.0f + ((float)temp_raw / 2.07f);
+
+        /* Estimate timestamp: oldest sample first, working forward */
+        samples[valid_count].timestamp_us = now_us -
+            ((packets_to_read - 1 - valid_count) * sample_period_us);
+
+        valid_count++;
+    }
+
+    /* Debug logging for first few reads */
+    static int debug_count = 0;
+    if (debug_count < 5 && valid_count > 0) {
+        LOG_INF("FIFO read: %d packets, accel=[%.2f,%.2f,%.2f] gyro=[%.4f,%.4f,%.4f]",
+                (int)valid_count,
+                (double)samples[0].accel_x, (double)samples[0].accel_y, (double)samples[0].accel_z,
+                (double)samples[0].gyro_x, (double)samples[0].gyro_y, (double)samples[0].gyro_z);
+        debug_count++;
+    }
+
+    return (int)valid_count;
 }
 
 int imu_get_config(imu_config_t *config)
 {
+    if (!config) {
+        return -EINVAL;
+    }
+
     *config = current_config;
     return 0;
 }

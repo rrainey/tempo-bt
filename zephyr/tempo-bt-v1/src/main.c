@@ -26,6 +26,7 @@
 #include "services/logger.h"
 #include "services/led.h"
 #include "services/aggregator.h"
+#include "services/orientation.h"
 #include "util/nmea_checksum.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -370,11 +371,11 @@ int main(void)
     int ret;
 
     const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-    if (device_is_ready(uart)) {
-        for (const char *p = "UART TEST\r\n"; *p; p++) {
-            uart_poll_out(uart, *p);
-        }
-    }
+    //if (device_is_ready(uart)) {
+    //    for (const char *p = "UART TEST\r\n"; *p; p++) {
+    //        uart_poll_out(uart, *p);
+    //    }
+    //}
 
     /*
      * Quiet the GNSS module VERY early - before any other initialization.
@@ -597,6 +598,17 @@ int main(void)
         LOG_ERR("Failed to initialize IMU: %d", ret);
     } else {
         LOG_INF("IMU initialized successfully");
+
+        /* Start orientation tracking immediately - the device is likely
+         * motionless during boot, which is ideal for AHRS initialization
+         * and gyroscope bias calibration. We maintain orientation
+         * continuously regardless of logging state. */
+        ret = orientation_start();
+        if (ret < 0) {
+            LOG_ERR("Failed to start orientation tracking: %d", ret);
+        } else {
+            LOG_INF("Orientation tracking started (AHRS initializing)");
+        }
     }
 
 #ifdef CONFIG_SHELL
@@ -631,10 +643,10 @@ int main(void)
         .base_path = "/logs",
         .use_date_folders = true,
         .use_uuid_names = true,
-        .imu_rate_hz = 40,      /* IMU disabled but keep config */
+        .imu_rate_hz = 50,      /* IMU enabled with 50 Hz */
         .env_rate_hz = 4,       /* Barometer data at 4 Hz in logs */
         .gnss_rate_hz = 1,      /* GPS at 1 Hz normally */
-        .enable_quaternion = false,  /* No IMU, so no quaternion */
+        .enable_quaternion = true,  /* include quaternion orientation */
         .enable_magnetometer = false,
         .auto_start_on_takeoff = true,   /* ENABLE THIS for automatic detection */
         .auto_stop_on_landing = true     /* Also enable automatic stop */

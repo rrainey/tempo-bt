@@ -23,7 +23,7 @@ A Zephyr RTOS-based flight data logging system for the nRF5340 platform, designe
   - part of this GitHub repository
 
 - **High-frequency sensor logging**
-  - 40 Hz IMU data (TDK InvenSense ICM-42688-V)
+  - 50 Hz IMU data (TDK InvenSense ICM-42688-V)
   - 4 Hz barometric pressure/temperature (Bosch BMP390)
   - 2-10 Hz GPS (u-blox SAM-M10Q)
   - Optional magnetometer support (MMC5983MA)
@@ -276,7 +276,7 @@ The device can also be controlled via the onboard button:
 Log files are in extended NMEA sentence format with NMEA-style checksums. Key sentence types:
 
 - `$PVER`: Version and metadata
-- `$PIMU`: IMU data (40 Hz)
+- `$PIMU`: IMU data (50 Hz)
 - `$PIM2`: Quaternion orientation
 - `$PENV`: Environmental data (pressure, temperature)
 - `$PFIX`: GPS fix information

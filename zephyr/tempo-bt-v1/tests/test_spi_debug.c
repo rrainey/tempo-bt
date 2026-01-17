@@ -12,10 +12,20 @@
 
 LOG_MODULE_REGISTER(spi_debug, LOG_LEVEL_INF);
 
-/* ICM-42688 WHO_AM_I register */
-#define ICM42688_REG_WHO_AM_I     0x75
-#define ICM42688_WHO_AM_I_VALUE   0x47
-#define ICM42688_SPI_READ_BIT     0x80
+/* ICM-42688 registers */
+#define ICM42688_REG_WHO_AM_I       0x75
+#define ICM42688_REG_DEVICE_CONFIG  0x11
+#define ICM42688_REG_INT_STATUS     0x2D
+#define ICM42688_WHO_AM_I_VALUE     0x47
+#define ICM42688_WHO_AM_I_VALUE_V   0xDB  /* ICM42688-V variant */
+#define ICM42688_SPI_READ_BIT       0x80
+
+/* DEVICE_CONFIG bits */
+#define BIT_SOFT_RESET              0x01
+
+/* INT_STATUS bits */
+#define BIT_INT_STATUS_RESET_DONE   0x10  /* Bit 4 */
+#define BIT_INT_STATUS_DATA_RDY     0x08  /* Bit 3 */
 
 /* SPI device from devicetree */
 #define IMU_SPI_NODE DT_NODELABEL(icm42688)
@@ -147,6 +157,111 @@ static int test_different_modes(const struct device *spi_dev)
     return 0;
 }
 
+/* Helper to read a single register */
+static int spi_read_reg(const struct device *spi_dev, const struct spi_config *cfg,
+                        uint8_t reg, uint8_t *value)
+{
+    uint8_t tx_data[2] = {reg | ICM42688_SPI_READ_BIT, 0};
+    uint8_t rx_data[2] = {0};
+
+    struct spi_buf tx_buf = {.buf = tx_data, .len = 2};
+    struct spi_buf rx_buf = {.buf = rx_data, .len = 2};
+    struct spi_buf_set tx_set = {.buffers = &tx_buf, .count = 1};
+    struct spi_buf_set rx_set = {.buffers = &rx_buf, .count = 1};
+
+    int ret = spi_transceive(spi_dev, cfg, &tx_set, &rx_set);
+    if (ret == 0) {
+        *value = rx_data[1];
+    }
+    return ret;
+}
+
+/* Helper to write a single register */
+static int spi_write_reg(const struct device *spi_dev, const struct spi_config *cfg,
+                         uint8_t reg, uint8_t value)
+{
+    uint8_t tx_data[2] = {reg, value};  /* No read bit for write */
+
+    struct spi_buf tx_buf = {.buf = tx_data, .len = 2};
+    struct spi_buf_set tx_set = {.buffers = &tx_buf, .count = 1};
+
+    return spi_write(spi_dev, cfg, &tx_set);
+}
+
+/* Test soft reset sequence - mimics what the Zephyr driver does */
+static int test_soft_reset(const struct device *spi_dev, const struct spi_config *cfg)
+{
+    int ret;
+    uint8_t value;
+
+    LOG_INF("=== Testing Soft Reset Sequence ===");
+
+    /* Step 1: Read WHO_AM_I before reset */
+    ret = spi_read_reg(spi_dev, cfg, ICM42688_REG_WHO_AM_I, &value);
+    if (ret < 0) {
+        LOG_ERR("Failed to read WHO_AM_I before reset: %d", ret);
+        return ret;
+    }
+    LOG_INF("WHO_AM_I before reset: 0x%02X", value);
+
+    /* Step 2: Read INT_STATUS before reset */
+    ret = spi_read_reg(spi_dev, cfg, ICM42688_REG_INT_STATUS, &value);
+    if (ret < 0) {
+        LOG_ERR("Failed to read INT_STATUS before reset: %d", ret);
+        return ret;
+    }
+    LOG_INF("INT_STATUS before reset: 0x%02X (RESET_DONE=%d, DATA_RDY=%d)",
+            value,
+            (value & BIT_INT_STATUS_RESET_DONE) ? 1 : 0,
+            (value & BIT_INT_STATUS_DATA_RDY) ? 1 : 0);
+
+    /* Step 3: Issue soft reset */
+    LOG_INF("Issuing soft reset (writing 0x%02X to DEVICE_CONFIG 0x%02X)...",
+            BIT_SOFT_RESET, ICM42688_REG_DEVICE_CONFIG);
+    ret = spi_write_reg(spi_dev, cfg, ICM42688_REG_DEVICE_CONFIG, BIT_SOFT_RESET);
+    if (ret < 0) {
+        LOG_ERR("Failed to write soft reset: %d", ret);
+        return ret;
+    }
+
+    /* Step 4: Wait and poll INT_STATUS at various intervals */
+    LOG_INF("Polling INT_STATUS after reset...");
+
+    int delays_ms[] = {1, 2, 5, 10, 20, 50, 100};
+    int cumulative_ms = 0;
+
+    for (int i = 0; i < ARRAY_SIZE(delays_ms); i++) {
+        k_msleep(delays_ms[i]);
+        cumulative_ms += delays_ms[i];
+
+        ret = spi_read_reg(spi_dev, cfg, ICM42688_REG_INT_STATUS, &value);
+        if (ret < 0) {
+            LOG_ERR("  @%dms: Failed to read INT_STATUS: %d", cumulative_ms, ret);
+            continue;
+        }
+
+        LOG_INF("  @%3dms: INT_STATUS=0x%02X (RESET_DONE=%d, DATA_RDY=%d)",
+                cumulative_ms, value,
+                (value & BIT_INT_STATUS_RESET_DONE) ? 1 : 0,
+                (value & BIT_INT_STATUS_DATA_RDY) ? 1 : 0);
+
+        if (value & BIT_INT_STATUS_RESET_DONE) {
+            LOG_INF("  >>> RESET_DONE bit detected at %dms!", cumulative_ms);
+            break;
+        }
+    }
+
+    /* Step 5: Verify WHO_AM_I after reset */
+    ret = spi_read_reg(spi_dev, cfg, ICM42688_REG_WHO_AM_I, &value);
+    if (ret < 0) {
+        LOG_ERR("Failed to read WHO_AM_I after reset: %d", ret);
+        return ret;
+    }
+    LOG_INF("WHO_AM_I after reset: 0x%02X", value);
+
+    return 0;
+}
+
 static int test_cs_gpio_access(void)
 {
     const struct gpio_dt_spec *cs_gpio = &cs_gpio_spec;
@@ -211,73 +326,35 @@ int run_spi_debug_test(void)
     
     LOG_INF("Starting SPI debug test for ICM-42688");
     
-    /* First test CS GPIO access */
-    ret = test_cs_gpio_access();
-    if (ret < 0) {
-        LOG_ERR("CS GPIO access test failed - this suggests P0.11 conflict!");
-        LOG_ERR("Check if GPIO forwarder is properly disabled");
-        return ret;
-    }
-    
-    /* Get SPI device */
+    /* Minimal test - just verify SPI communication works without
+     * doing anything that might interfere with the driver's init sequence */
+
     spi_dev = DEVICE_DT_GET(DT_BUS(IMU_SPI_NODE));
     if (!device_is_ready(spi_dev)) {
         LOG_ERR("SPI device not ready");
         return -ENODEV;
     }
     LOG_INF("SPI device ready: %s", spi_dev->name);
-    
-    /* Configure CS GPIO manually for testing */
-    if (gpio_is_ready_dt(&cs_gpio_spec)) {
-        ret = gpio_pin_configure_dt(&cs_gpio_spec, GPIO_OUTPUT_INACTIVE);
-        if (ret == 0) {
-            LOG_INF("CS GPIO configured: port=%s, pin=%d", 
-                    cs_gpio_spec.port->name, cs_gpio_spec.pin);
+
+    /* Simple WHO_AM_I read in Mode 0 */
+    struct spi_config mode0_cfg = {
+        .frequency = 1000000,
+        .operation = SPI_OP_MODE_MASTER | SPI_WORD_SET(8),
+        .cs = {
+            .gpio = cs_gpio_spec,
+            .delay = 0
         }
+    };
+    uint8_t who_am_i;
+    ret = spi_read_reg(spi_dev, &mode0_cfg, ICM42688_REG_WHO_AM_I, &who_am_i);
+    if (ret == 0) {
+        LOG_INF("WHO_AM_I: 0x%02X (expected 0xDB for ICM42688-V)", who_am_i);
+    } else {
+        LOG_ERR("WHO_AM_I read failed: %d", ret);
+        return ret;
     }
-    
-    /* Allow device to power up */
-    k_msleep(100);
-    
-    /* Test different SPI modes */
-    test_different_modes(spi_dev);
-    
-    /* Test manual CS control */
-    LOG_INF("\n=== Testing manual CS control ===");
-    if (gpio_is_ready_dt(&cs_gpio_spec)) {
-        /* Pull CS low manually */
-        gpio_pin_set_dt(&cs_gpio_spec, 1);  /* Active low, so 1 = inactive */
-        k_usleep(10);
-        gpio_pin_set_dt(&cs_gpio_spec, 0);  /* Active low, so 0 = active */
-        k_usleep(10);
-        
-        /* Try SPI without automatic CS */
-        struct spi_config manual_cfg = {
-            .frequency = 1000000,
-            .operation = SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_CS_ACTIVE_HIGH,
-            .cs = {0}  /* No automatic CS */
-        };
-        
-        uint8_t tx_data[2] = {ICM42688_REG_WHO_AM_I | ICM42688_SPI_READ_BIT, 0};
-        uint8_t rx_data[2] = {0xFF, 0xFF};
-        
-        struct spi_buf tx_buf = {.buf = tx_data, .len = 2};
-        struct spi_buf rx_buf = {.buf = rx_data, .len = 2};
-        struct spi_buf_set tx_set = {.buffers = &tx_buf, .count = 1};
-        struct spi_buf_set rx_set = {.buffers = &rx_buf, .count = 1};
-        
-        ret = spi_transceive(spi_dev, &manual_cfg, &tx_set, &rx_set);
-        
-        /* Pull CS high manually */
-        k_usleep(10);
-        gpio_pin_set_dt(&cs_gpio_spec, 1);  /* Inactive */
-        
-        if (ret == 0) {
-            LOG_INF("Manual CS result: 0x%02X", rx_data[1]);
-        }
-    }
-    
-    LOG_INF("\nSPI debug test completed");
+
+    LOG_INF("SPI debug test completed - device communication OK");
     
     return 0;
 }
