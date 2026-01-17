@@ -742,7 +742,7 @@ static void executive_handle_logging_state(float climb_rate)
     bool is_low_activity = fabsf(climb_rate) < EXEC_LOW_ACTIVITY_RATE_MPS;
 
     /* DEBUG: Periodically log climb rate and low activity counter */
-    LOG_INF("LOGGING: climb=%.2f m/s (%.0f ft/min), low_act=%s, counter=%u/%u",
+    LOG_DBG("LOGGING: climb=%.2f m/s (%.0f ft/min), low_act=%s, counter=%u/%u",
             climb_rate, climb_rate * 196.85f,
             is_low_activity ? "YES" : "NO",
             executive_state.low_activity_counter_s,
