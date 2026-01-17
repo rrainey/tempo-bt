@@ -66,6 +66,9 @@ static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(SW1_NODE, gpios);
 static struct gpio_callback button1_cb_data;
 #endif
 
+/* Forward declaration for LED state update */
+static void update_led_for_state(logger_state_t state);
+
 /* Button work handler for long press detection */
 static void button0_work_handler(struct k_work *work)
 {
@@ -79,12 +82,12 @@ static void button0_work_handler(struct k_work *work)
         if (press_duration >= BUTTON_LONG_PRESS_MS) {
             LOG_INF("Button 0 long press detected");
 
-            /* Toggle between idle and armed states */
+            /* Long press: manually start logging when armed
+             * This is a safety feature - requires deliberate action to start logging */
             logger_state_t state = logger_get_state();
-            if (state == LOGGER_STATE_IDLE) {
-                logger_arm();
-            } else if (state == LOGGER_STATE_ARMED) {
-                logger_disarm();
+            if (state == LOGGER_STATE_ARMED) {
+                button0_pending_start = true;
+                k_work_submit(&button0_action_work);
             }
         }
     }
@@ -96,7 +99,11 @@ static void button0_action_handler(struct k_work *work)
     ARG_UNUSED(work);
 
     if (button0_pending_start) {
-        logger_start();
+        int ret = logger_start();
+        if (ret == 0) {
+            /* Update LED to reflect new logging state */
+            update_led_for_state(logger_get_state());
+        }
     } else {
         logger_stop();
     }
@@ -130,19 +137,9 @@ static void button0_released(const struct device *dev, struct gpio_callback *cb,
 
     if (press_duration < BUTTON_LONG_PRESS_MS &&
         press_duration > BUTTON_DEBOUNCE_DELAY_MS) {
-        LOG_INF("Button 0 short press detected");
-
-        /* Short press: start/stop logging
-         * NOTE: Must defer to work queue - logger_start() does file I/O
-         * which requires significant stack space not available in ISR context */
-        logger_state_t state = logger_get_state();
-        if (state == LOGGER_STATE_ARMED) {
-            button0_pending_start = true;
-            k_work_submit(&button0_action_work);
-        } else if (state == LOGGER_STATE_LOGGING) {
-            button0_pending_start = false;
-            k_work_submit(&button0_action_work);
-        }
+        /* Short press: no effect (safety feature)
+         * Only long press can start logging to prevent accidental activation */
+        LOG_DBG("Button 0 short press - ignored");
     }
 }
 

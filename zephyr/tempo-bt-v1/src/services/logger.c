@@ -191,8 +191,8 @@ int logger_init(const logger_config_t *config)
     /* Initialize executive function */
     executive_init();
 
-    /* If we start in IDLE state, begin sampling immediately */
-    if (logger_state.state == LOGGER_STATE_IDLE) {
+    /* If we start in IDLE state, begin ground altitude sampling immediately */
+    if (logger_state.state == LOGGER_STATE_IDLE || logger_state.state == LOGGER_STATE_ARMED) {
         /* Get initial altitude and start sampling */
         baro_sample_t sample;
         if (baro_get_current_sample(&sample) == 0 && sample.pressure_valid) {
