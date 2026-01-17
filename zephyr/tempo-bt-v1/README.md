@@ -301,30 +301,24 @@ The RGB LED provides visual system status:
 
 | Color | Pattern | State |
 |-------|---------|-------|
-| Blue | Slow pulse | IDLE - Ready |
-| Green | Slow pulse | ARMED - Waiting for trigger |
-| Red | Fast flash | LOGGING - Recording data |
-| Yellow | Solid | File transfer active |
-| Magenta | Slow flash | Error state |
+| Blue | Slow pulse | ARMED - Ready |
+| Green | Slow pulse | Logging - waiting for aircraft exit |
+| Orange | Slow pulse | Logging - in freefall or under canopy |
+| White | Solid | File transfer active |
+| Red | Slow pulse | Fatal Error |
+
+Additionally, there is a separate Red LED which will blink when there is no usable GPS signal.
+
+A separate Amber LED is the USB charging indicator.
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Device not visible over Bluetooth**
-   - Ensure the device is powered on
-   - Check that Bluetooth is enabled on your computer
-   - Try resetting the device
-
-2. **SD card not detected**
+1. **SD card not detected**
    - Verify card is properly inserted
-   - Ensure card is formatted as exFAT
+   - Validate that the SD card is readable on a PC
    - Check for supported card size (max 32GB recommended)
-
-3. **mcumgr connection fails**
-   - Update mcumgr to latest version
-   - Check Bluetooth adapter compatibility
-   - Try shorter connection intervals
 
 ### Debug Output
 
