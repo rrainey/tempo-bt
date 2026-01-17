@@ -91,19 +91,19 @@ int app_storage_init(void)
     
     LOG_INF("Storage initialized using %s", backend_name);
 
-    /* Create logs directory based on backend */
-    if (backend == STORAGE_BACKEND_LITTLEFS) {
-        ret = fs_mkdir("/lfs/logs");
+    /* Create logs directory based on backend if it doesn't exist */
+    const char *logs_path = (backend == STORAGE_BACKEND_LITTLEFS) ? "/lfs/logs" : "/SD:/logs";
+    struct fs_dirent entry;
+
+    ret = fs_stat(logs_path, &entry);
+    if (ret == 0) {
+        LOG_INF("Logs directory exists");
     } else {
-        ret = fs_mkdir("/SD:/logs");
-    }
-    
-    if (ret < 0 && ret != -EEXIST) {
-        LOG_ERR("Error creating logs directory: %d", ret);
-        return ret;
-    } else if (ret == -EEXIST) {
-        LOG_INF("Logs directory already exists");
-    } else {
+        ret = fs_mkdir(logs_path);
+        if (ret < 0) {
+            LOG_ERR("Error creating logs directory: %d", ret);
+            return ret;
+        }
         LOG_INF("Created logs directory");
     }
 
@@ -138,7 +138,7 @@ int app_init(void)
     /* Note: BLE advertising is already started by ble_mcumgr_init() */
     /* No need to start it again here */
 
-    LOG_INF("Bluetooth initialized and advertising");
+    //LOG_INF("Bluetooth initialized and advertising");
 
     /* Register custom mcumgr handlers */
     tempo_mgmt_register();

@@ -79,8 +79,6 @@ int storage_fatfs_init(void)
     uint32_t block_count;
     //struct disk_info info;
 
-    LOG_INF("Initializing FAT storage backend");
-
     /* Check if disk is present */
     ret = disk_access_init(STORAGE_PARTITION);
     if (ret != 0) {
@@ -160,11 +158,6 @@ static int ensure_mounted(void)
     storage_state.mounted = true;
     LOG_INF("FAT filesystem mounted at %s", FATFS_MOUNT_POINT);
 
-    /* Create base directories */
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/logs", FATFS_MOUNT_POINT);
-    fs_mkdir(path);  /* Ignore error if already exists */
-
     return 0;
 }
 
@@ -173,6 +166,8 @@ static int create_directory_path(const char *full_path)
     char path[MAX_PATH_LEN];
     char *p;
     int ret;
+
+    LOG_INF("create directory path %s", full_path);
 
     /* Make a working copy */
     strncpy(path, full_path, sizeof(path) - 1);
@@ -191,30 +186,22 @@ static int create_directory_path(const char *full_path)
     p = path;
     while ((p = strchr(p + 1, '/')) != NULL) {
         *p = '\0';
-        
-        struct fs_dirent entry;
-        ret = fs_stat(path, &entry);
-        if (ret != 0) {
-            /* Directory doesn't exist, create it */
-            ret = fs_mkdir(path);
-            if (ret != 0 && ret != -EEXIST) {
-                LOG_ERR("Failed to create directory %s: %d", path, ret);
-                return ret;
-            }
-        }
-        
-        *p = '/';
-    }
 
-    /* Create the final directory */
-    struct fs_dirent entry;
-    ret = fs_stat(path, &entry);
-    if (ret != 0) {
+        /* Try to create directory - ignore EEXIST */
         ret = fs_mkdir(path);
         if (ret != 0 && ret != -EEXIST) {
             LOG_ERR("Failed to create directory %s: %d", path, ret);
             return ret;
         }
+
+        *p = '/';
+    }
+
+    /* Create the final directory */
+    ret = fs_mkdir(path);
+    if (ret != 0 && ret != -EEXIST) {
+        LOG_ERR("Failed to create directory %s: %d", path, ret);
+        return ret;
     }
 
     return 0;
@@ -226,7 +213,10 @@ static const char *translate_path(const char *log_path)
     static char fat_path[MAX_PATH_LEN];
     
     /* Convert paths to /SD:/... */
-    if (strncmp(log_path, "/lfs/", 5) == 0) {
+    if (strncmp(log_path, "/SD:/", 5) == 0) {
+        /* do nothing */
+        strcpy(fat_path, log_path);
+    } else if (strncmp(log_path, "/lfs/", 5) == 0) {
         /* Legacy /lfs/ prefix - strip it */
         snprintf(fat_path, sizeof(fat_path), "%s%s", FATFS_MOUNT_POINT, log_path + 4);
     } else if (log_path[0] == '/') {

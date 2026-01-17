@@ -8,11 +8,10 @@
 
  #include <zephyr/dt-bindings/sensor/icm42688.h>
 
- /* 
+
 &rtc0 {
     status = "okay";
 };
-*/
 
 /* UART for SAM-M10Q GNSS */
 &uart2 {

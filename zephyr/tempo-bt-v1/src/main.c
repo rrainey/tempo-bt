@@ -190,7 +190,6 @@ int buttons_init(void)
     
     gpio_add_callback(button0.port, &button0_cb_data);
     
-    LOG_INF("Button 0 initialized");
 #endif
 
 #if DT_NODE_HAS_STATUS(SW1_NODE, okay)
@@ -214,7 +213,6 @@ int buttons_init(void)
     gpio_init_callback(&button1_cb_data, button1_pressed, BIT(button1.pin));
     gpio_add_callback(button1.port, &button1_cb_data);
     
-    LOG_INF("Button 1 initialized");
 #endif
 
     return 0;
@@ -232,20 +230,20 @@ static void update_led_for_state(logger_state_t state)
         
     case LOGGER_STATE_ARMED:
         /* Green slow blink for armed */
-        set_color_led_state(RGB_GREEN, true);
+        set_color_led_state(RGB_ORANGE, true);
         LOG_INF("LED: Green (armed)");
         break;
         
     case LOGGER_STATE_LOGGING:
         /* Red slow blink for logging */
-        set_color_led_state(RGB_RED, true);
+        set_color_led_state(RGB_GREEN, true);
         LOG_INF("LED: Red (logging)");
         break;
         
     case LOGGER_STATE_ERROR:
     default:
         /* Orange slow blink for error */
-        set_color_led_state(RGB_ORANGE, true);
+        set_color_led_state(RGB_RED, true);
         LOG_INF("LED: Orange (error)");
         break;
     }
@@ -265,7 +263,7 @@ static void led_event_handler(const app_event_t *event, void *user_data)
     case EVT_STORAGE_ERROR:
     case EVT_SENSOR_ERROR:
         /* Flash orange for errors */
-        set_color_led_state(RGB_ORANGE, true);
+        set_color_led_state(RGB_RED, true);
         break;
         
     case EVT_STORAGE_LOW:
@@ -286,7 +284,7 @@ static event_subscriber_t led_subscriber;
 static void indicate_system_error(const char *error_msg)
 {
     LOG_ERR("%s", error_msg);
-    set_color_led_state(RGB_ORANGE, true);
+    set_color_led_state(RGB_RED, true);
 }
 
 static void indicate_system_ready(void)
@@ -352,9 +350,16 @@ int main(void)
             uart_poll_out(uart, *p);
         }
     }
-    
+
+    /*
+     * Quiet the GNSS module VERY early - before any other initialization.
+     * The SAM-M10Q continues running after CPU reset and will flood the
+     * UART with NMEA data, causing buffer overruns if we wait too long.
+     */
+    gnss_early_quiet();
+
     //printk("boot\n");
-    LOG_INF("Tempo-BT V1 started successfully");
+    LOG_INF("Tempo-BT started");
 
     if (!gpio_is_ready_dt(&led)) {
 		//return 0;
@@ -550,8 +555,7 @@ int main(void)
         LOG_INF("Barometer measurements started at 8 Hz");
     }
 
-#if 0
-    /* Initialize IMU - but skip it for now due to hardware issues */
+    /* Initialize IMU  */
     LOG_INF("About to init IMU...");
     ret = imu_init();
     if (ret < 0) {
@@ -568,8 +572,8 @@ int main(void)
     imu_test_init();
 
 #endif
-    
 
+#if 0
     /* Test Barometer (BMP390) */
     LOG_INF("Testing BMP390 barometer...");
     extern int test_baro(void);
@@ -579,12 +583,14 @@ int main(void)
     } else {
         LOG_INF("Barometer test completed successfully");
     }
-    #endif
+#endif
 
+#ifdef called_elsewhere
     ret = file_writer_init(NULL);  // Use default config
     if (ret < 0) {
         LOG_ERR("Failed to initialize file writer: %d", ret);
     }
+#endif
 
     logger_config_t logger_cfg = {
         .base_path = "/logs",

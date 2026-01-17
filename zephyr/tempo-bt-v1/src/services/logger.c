@@ -126,11 +126,10 @@ int logger_init(const logger_config_t *config)
     
     /* Initialize file writer with reasonable defaults */
     file_writer_config_t writer_config = {
-        .buffer_size = 2048,
-        .flush_interval_ms = 250,
-        .queue_depth = 128
+        .buffer_size = 4096,
+        .flush_interval_ms = 250
     };
-    
+
     int ret = file_writer_init(&writer_config);
     if (ret != 0) {
         LOG_ERR("Failed to initialize file writer: %d", ret);
@@ -410,21 +409,7 @@ int logger_get_session_info(uint32_t *session_id, uint64_t *start_time,
 /* Internal functions */
 static void aggregator_output_to_file(const char *line, size_t len)
 {
-    write_priority_t priority = WRITE_PRIORITY_MEDIUM;
-    
-    /* Determine priority based on sentence type */
-    if (strncmp(line, "$PIMU", 5) == 0 || strncmp(line, "$PIM2", 5) == 0) {
-        priority = WRITE_PRIORITY_CRITICAL;  /* IMU data is critical */
-    } else if (strncmp(line, "$PENV", 5) == 0) {
-        priority = WRITE_PRIORITY_HIGH;      /* Baro data is high priority */
-    } else if (strncmp(line, "$PMAG", 5) == 0) {
-        priority = WRITE_PRIORITY_MEDIUM;    /* Mag data is medium */
-    } else if (strncmp(line, "$PFIX", 5) == 0 || strncmp(line, "$PTH", 4) == 0) {
-        priority = WRITE_PRIORITY_LOW;       /* GNSS data is low priority */
-    }
-    
-    /* Queue for writing */
-    int ret = file_writer_write(line, len, priority);
+    int ret = file_writer_write(line, len);
     if (ret != 0 && ret != -ENOSPC) {
         LOG_ERR("Failed to write line: %d", ret);
     }
@@ -434,24 +419,34 @@ static int create_session_directory(void)
 {
     //int ret;
     struct tm *tm;
-    time_t now = logger_state.session_start_us / 1000000;
-    
+    struct timespec ts;
+    time_t now;
+
+    /* Get actual system time (set by GNSS) instead of uptime */
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        now = ts.tv_sec;
+    } else {
+        /* Fallback to uptime if CLOCK_REALTIME fails */
+        LOG_WRN("CLOCK_REALTIME not available, using uptime for directory name");
+        now = logger_state.session_start_us / 1000000;
+    }
+
     /* Base path */
     strcpy(logger_state.session_path, logger_state.config.base_path);
-    
+
     /* Add date folder if configured */
     if (logger_state.config.use_date_folders) {
         char date_str[16];
         tm = gmtime(&now);
         strftime(date_str, sizeof(date_str), "%Y%m%d", tm);
-        
+
         strcat(logger_state.session_path, "/");
         strcat(logger_state.session_path, date_str);
     }
-    
+
     /* Add session folder */
     strcat(logger_state.session_path, "/");
-    
+
     if (logger_state.config.use_uuid_names) {
         char uuid[9];
         snprintf(uuid, sizeof(uuid), "%08X", logger_state.session_id);
@@ -462,14 +457,14 @@ static int create_session_directory(void)
         strftime(time_str, sizeof(time_str), "%H%M%S", tm);
         strcat(logger_state.session_path, time_str);
     }
-    
+
     /* Create directories - storage layer should handle this */
     /* For now, we'll just create the file path */
-    
+
     /* Build full file path */
     snprintf(logger_state.log_file_path, sizeof(logger_state.log_file_path),
              "%s/flight.txt", logger_state.session_path);
-    
+
     return 0;
 }
 

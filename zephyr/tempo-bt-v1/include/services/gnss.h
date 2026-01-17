@@ -69,10 +69,21 @@ typedef void (*gnss_fix_callback_t)(const gnss_fix_t *fix);
 typedef void (*gnss_nmea_callback_t)(const char *sentence, size_t len);
 
 /**
+ * @brief Early GNSS quiet - call very early in boot
+ *
+ * Sends commands to quiet the GNSS module and drain any pending data.
+ * This should be called before other initialization to prevent buffer
+ * overruns from a still-running GNSS after CPU reset.
+ *
+ * @return 0 on success, negative error code on failure
+ */
+int gnss_early_quiet(void);
+
+/**
  * @brief Initialize the GNSS service
- * 
+ *
  * Sets up UART for GNSS communication
- * 
+ *
  * @return 0 on success, negative error code on failure
  */
 int gnss_init(void);

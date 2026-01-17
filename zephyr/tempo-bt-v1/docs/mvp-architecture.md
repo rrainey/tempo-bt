@@ -1,6 +1,6 @@
 # Tempo-BT (V1) — Zephyr Device Application Architecture
 
-> Scope: architecture for the **V1 prototype** (nRF5340 / NORA-B106) with ICM-42688-V (SPI), BMP390 (I²C), optional MMC5983MA (I²C), u-blox SAM-M10Q (UART), **QSPI NOR** (littlefs).
+> Scope: architecture for the **V1 prototype** (nRF5340 / NORA-B106) with ICM-42688-V (SPI), BMP390 (I²C), optional MMC5983MA (I²C), u-blox SAM-M10Q (UART), **SD Card** (FAT/exFAT).
 > Focus areas per request:
 >
 > 1. **File + folder (project) structure**
@@ -24,524 +24,406 @@ tempo-bt/
 │     └─ tempo_v1.conf           # Board-specific prj.conf deltas (if needed)
 │
 ├─ include/
-│  ├─ app/app_state.h            # System/session state structs & enums
 │  ├─ app/events.h               # Event IDs, payloads, and helper macros
 │  ├─ app/log_format.h           # $Pxxx sentence format & helpers (NMEA)
-│  ├─ app/paths.h                # FS paths, naming & partition IDs
 │  │
 │  ├─ services/timebase.h        # Time service API (monotonic, GNSS tie)
 │  ├─ services/imu.h             # ICM42688 sample structs & API
 │  ├─ services/baro.h            # BMP390 sample structs & API
-│  ├─ services/mag.h             # MMC5983MA sample structs & API (optional)
 │  ├─ services/gnss.h            # GNSS NMEA/UBX ingest API
 │  ├─ services/aggregator.h      # Merges streams → record/sentence builder
 │  ├─ services/logger.h          # Logging session lifecycle & policies
-│  ├─ services/file_writer.h     # Async writer (NMEA sentence | binary block)
-│  ├─ services/storage.h         # ILogSink abstraction (littlefs/FATFS)
-│  ├─ services/upload.h          # mcumgr/SMP file ops facade
-│  ├─ services/dfu.h             # OTA (MCUboot) helpers
+│  ├─ services/file_writer.h     # Async buffered writer (ring buffer)
+│  ├─ services/storage.h         # Storage abstraction (littlefs/FATFS)
+│  ├─ services/orientation.h     # AHRS/orientation tracking API
+│  ├─ services/led.h             # RGB LED service API
 │  │
-│  └─ util/ringbuf.h             # Lock-free buffers, pool allocs, CRC helpers
+│  └─ fusion.h                   # Fusion AHRS algorithm headers
 │
 ├─ src/
-│  ├─ main.c                     # Init order, threads, event loop, health
-│  ├─ app_init.c                 # Storage mount, BLE/mcumgr, DFU safety
+│  ├─ main.c                     # Init order, button handling, event loop
+│  ├─ app_init.c                 # Storage mount, BLE/mcumgr initialization
 │  ├─ events.c                   # Event bus (k_fifo/k_msgq) + subscribers
-│  │  [REMOVED: app_state.c]
+│  ├─ fusion.c                   # Fusion AHRS algorithm (xioTechnologies)
 │  │
 │  ├─ services/
 │  │  ├─ timebase.c             # 64-bit mono clock; GNSS time correlation
 │  │  ├─ imu_icm42688.c         # SPI4 + INT1/FIFO DMA; ODR control
 │  │  ├─ baro_bmp390.c          # I²C + DRDY; pressure/temperature
-│  │  ├─ mag_mmc5983ma.c        # I²C + INT; optional
-│  │  ├─ gnss_m10q.c            # UART DMA; NMEA/UBX parse; `$PTH` hooks
+│  │  ├─ gnss_m10q.c            # UART async; NMEA/UBX parse; early quiet
 │  │  ├─ aggregator.c           # Streams → `$PIMU/$PIM2/$PENV/...` w/ checksums
-│  │  ├─ logger.c               # Session mgmt; start/stop; rate schedules
-│  │  ├─ file_writer.c          # Background I/O; flush; backpressure
-│  │  ├─ storage_littlefs.c     # QSPI NOR backend (default for V1)
-│  │  ├─ storage_fatfs.c        # SD/FAT backend (compiled-in optional)
-│  │  ├─ upload_mcumgr.c        # FS mgmt facade for iOS client
-│  │  └─ dfu.c                  # Image mgmt helpers (SMP + MCUboot)
-│  │
-│  ├─ drivers/                   # Shims for any out-of-tree sensors (if needed)
-│  │  ├─ icm42688_shim.c
-│  │  └─ mmc5983ma_driver.c
+│  │  ├─ orientation.c          # AHRS wrapper using Fusion algorithm
+│  │  ├─ logger.c               # Session mgmt; start/stop; takeoff detection
+│  │  ├─ file_writer.c          # Ring buffer + worker thread
+│  │  ├─ storage.c              # Storage abstraction layer
+│  │  ├─ storage_littlefs.c     # QSPI NOR backend (optional)
+│  │  ├─ storage_fatfs.c        # SD Card FAT/exFAT backend (primary)
+│  │  └─ led.c                  # PWM-based RGB LED control
 │  │
 │  └─ util/
-│     ├─ ringbuf.c
-│     └─ crc32.c
+│     └─ nmea_checksum.c        # NMEA checksum utilities
 │
 ├─ config/
-│  ├─ settings.c                 # Zephyr settings keys & defaults (`app/*`)
-│  └─ partitions.yml             # Flash partitions (mcuboot, littlefs, etc.)
+│  └─ settings.c                 # Zephyr settings keys & defaults (`app/*`)
 │
-├─ subsys/
-│  └─ event_bus/
-│     ├─ event_bus.h             # Light wrapper over k_fifo/k_msgq
-│     └─ event_bus.c
+├─ docs/
+│  └─ mvp-architecture.md        # This document
 │
-├─ samples/                      # (Optional) Narrow demos (e.g., “log-to-qspi”)
-├─ tests/                        # Unit/integration (ztest) + hardware smoke tests
 └─ scripts/
-   ├─ gen_version.py             # Embed git/semver into $PVER
    └─ host_tools/verify_log.py   # PC-side log validator
 ```
 
 ---
 
-## 2) DeviceTree Overlay (V1 essentials) & Build Config
+## 2) Runtime Architecture (what each part does)
 
-**`boards/nrf5340dk_nrf5340/tempo_v1.overlay` (illustrative)**
+### 2.1 Layered view
 
-```dts
-/* QSPI NOR — MX25R64, littlefs target */
-&qspi {
-    status = "okay";
-    pinctrl-0 = <&qspi_default>;
-    label = "qspi_nor";
-    mx25r64: mx25r6435f@0 {
-        compatible = "jedec,spi-nor";
-        reg = <0>;
-        /* Quad mode enabled by driver; pins are fixed to the nRF QSPI pads */
-    };
-};
-
-/* ICM-42688-V on SPIM4 + INT1 on P1.07 (D6) */
-&spi4 {
-    status = "okay";
-    icm42688@0 {
-        compatible = "invensense,icm42688";
-        reg = <0>;
-        spi-max-frequency = <32000000>;
-        cs-gpios = <&gpio0 11 GPIO_ACTIVE_LOW>;
-        int1-gpios = <&gpio1 7 GPIO_ACTIVE_HIGH>;
-        label = "ICM42688";
-    };
-}
-
-/* BMP390 + MMC5983MA on I2C bus P1.02/1.03; DRDY IRQs on D11/D9 */
-&i2c0 {
-    status = "okay";
-    bmp390@76 {
-        compatible = "bosch,bmp3";
-        reg = <0x76>;
-        int-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
-        label = "BMP390";
-    };
-    mmc5983@30 {
-        compatible = "memsic,mmc5983ma";
-        reg = <0x30>;
-        int-gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;
-        label = "MMC5983MA";
-    };
-}
-
-/* GNSS on selected UART (choose one assembly path) */
-&uart2 { status = "okay";  /* SAM-M10Q */ };
-&uart3 { status = "disabled"; };
-```
-
-**`prj.conf` (highlights)**
-
-```conf
-# BLE + SMP (file xfer) + DFU
-CONFIG_BT=y
-CONFIG_BT_PERIPHERAL=y
-CONFIG_MCUMGR=y
-CONFIG_MCUMGR_SMP_BT=y
-CONFIG_FS_MGMT=y
-CONFIG_IMG_MANAGER=y
-CONFIG_BOOTLOADER_MCUBOOT=y
-
-# Filesystems & storage
-CONFIG_FILE_SYSTEM=y
-CONFIG_FS_LITTLEFS=y
-CONFIG_FLASH=y
-CONFIG_NVS=y
-CONFIG_DISK_ACCESS=y
-# (Optional) FATFS if SD present on future revs:
-# CONFIG_FAT_FILESYSTEM_ELM=y
-
-# Drivers
-CONFIG_SENSOR=y
-CONFIG_I2C=y
-CONFIG_SPI=y
-CONFIG_UART_ASYNC_API=y
-CONFIG_NRFX_QSPI=y
-
-# RTOS & debug
-CONFIG_MAIN_STACK_SIZE=4096
-CONFIG_HEAP_MEM_POOL_SIZE=8192
-CONFIG_LOG=y
-CONFIG_LOG_BACKEND_RTT=y
-CONFIG_PM_DEVICE=y
-```
-
----
-
-## 3) Runtime Architecture (what each part does)
-
-### 3.1 Layered view
-
-Note: Current implementation has:
-- ✓ BMP390 (working)
-- ✓ GNSS (working)
-- ✓ QSPI storage (working)
+**Current implementation status:**
+- ✓ BMP390 barometer (working, 8Hz with takeoff detection)
+- ✓ GNSS SAM-M10Q (working, 1-10Hz dynamic, UBX config)
+- ✓ SD Card storage (FAT/exFAT, primary storage)
+- ✓ Orientation tracking (Fusion AHRS algorithm)
+- ✓ RGB LED status (PWM-based, state indication)
+- ✓ Button controls (short/long press handling)
+- ✓ BLE file transfer (mcumgr)
 - ✗ ICM42688 IMU (hardware issues - WHO_AM_I mismatch)
-- ✗ MMC5983MA (not integrated)
+- ✗ MMC5983MA magnetometer (not integrated)
 
 ```mermaid
 flowchart TB
-  subgraph App["Application"]
-    UI[Buttons/LEDs\n(minimal)] --> Logger
-    Logger[Logger Service\n(session state machine)]
-    Upload[Upload Service\n(mcumgr FS + DFU)]
+  subgraph App["Application Layer"]
+    Main[main.c\nButton handlers\nInit sequence]
+    Logger[Logger Service\nSession state machine\nTakeoff detection]
+    LED[LED Service\nPWM RGB status]
   end
 
-  subgraph Services
-    Agg[Aggregator\n(sentence builder + rates)]
-    Writer[File Writer\n(async flush, CRC)]
-    Tm[Timebase\n(64-bit mono + GNSS tie)]
+  subgraph Services["Core Services"]
+    Agg[Aggregator\nSentence builder\nRing buffers]
+    Orient[Orientation\nFusion AHRS]
+    Writer[File Writer\nRing buffer + thread]
+    Tm[Timebase\n64-bit mono + RTC]
   end
 
   subgraph Drivers["Sensor + IO Drivers"]
-    IMU[ICM42688 (SPI4 + INT1)]
-    BARO[BMP390 (I²C + DRDY)]
-    MAG[MMC5983MA (I²C + INT)]
-    GNSS[GNSS (UART DMA)]
-    QSPI[QSPI NOR (littlefs)]
+    IMU[ICM42688 SPI]
+    BARO[BMP390 I²C]
+    GNSS[SAM-M10Q UART]
+    Storage[SD Card FAT]
   end
 
-  App --> Agg
-  IMU --> Agg
+  Main --> Logger
+  Main --> LED
+  Logger --> Agg
+  IMU --> Agg --> Orient
   BARO --> Agg
-  MAG --> Agg
+  BARO --> Logger
   GNSS --> Agg
   Tm --> Agg
 
-  Agg --> Writer --> SD or QSPI
-
-  App --> Upload --> SD or QSPI
+  Agg --> Writer --> Storage
 ```
 
-### 3.2 Concurrency model (threads & priorities)
+### 2.2 Concurrency model (threads & priorities)
 
-* **IMU thread (high)**: handles SPI burst reads on FIFO/INT1; batches samples.
-* **BARO thread (med)**: handles DRDY; compensates & outputs pressure/temp.
-* **MAG thread (med, optional)**: magnetometer sampling on INT/timer.
-* **GNSS thread (med)**: UART DMA; parses NMEA/UBX; pushes GGA/VTG; triggers `$PTH`.
-* **Aggregator (med/low)**: merges newest batches → constructs `$PIMU`, `$PIM2`, `$PENV`, `$PTH`, `$PST`, `$PSFC`, `$PVER` lines per spec; computes NMEA checksums.
-* **File writer (low)**: rate-limited appender to littlefs; handles backpressure.
-* **mcumgr/BT**: Zephyr’s SMP runs in its own work context; our **Upload** facade maps app paths → FS mgmt.
+| Thread | Priority | Purpose |
+|--------|----------|---------|
+| **File writer** | `K_PRIO_PREEMPT(10)` | Drains ring buffer to SD card |
+| **Aggregator** | `K_PRIO_PREEMPT(5)` | Builds NMEA sentences |
+| **GNSS RX** | `K_PRIO_PREEMPT(5)` | UART async callback context |
+| **Main** | Default | Button handling, health monitoring |
 
-**Communication primitives**
+**Communication primitives:**
 
-* **Lock-free ring buffers** per producer (IMU/BARO/MAG/GNSS) → Aggregator.
-* **Event bus** (thin wrapper over `k_fifo` or `k_msgq`) for cross-cutting events (session start/stop, errors, storage status, phase transitions).
-* **Atomic flags** in `app_state` for fast “should sample?” checks.
+* **Ring buffer** (Zephyr `sys/ring_buffer.h`) in file_writer for async I/O
+* **Spinlock-protected ring buffers** in aggregator for IMU/BARO/GNSS samples
+* **Event bus** (`k_fifo`/`k_msgq`) for state change notifications
+* **Mutexes** for thread-safe stats access and orientation state
 
 ---
 
-## 4) Where State Lives
+## 3) Where State Lives
 
-### 4.1 Persistent configuration (NVS / `settings`)
+### 3.1 Persistent configuration (NVS / `settings`)
 
-* Stored via Zephyr `settings` in internal flash.
-* Keys (examples):
+* Stored via Zephyr `settings` in internal flash
+* Loader in `config/settings.c`
+* Keys include BLE name, rate settings
 
-  * `app/ble_name`, `app/unit_system`
-  * `app/imu_odr`, `app/baro_rate`, `app/mag_rate`
-  * `app/log_backend` = `littlefs` | `fatfs`
-  * `app/gnss_rate_hz` (NMEA)
-  * `app/pps_enabled` (V1 = 0; V2 enables)
-* Loader in `config/settings.c`; defaults compiled from Kconfig symbols.
-
-### 4.2 System state (RAM, owned by logger service)
+### 3.2 System state (RAM, owned by logger service)
 
 * **Logger state** (`logger_state_t`) serves as the primary system state:
-  * States: `IDLE` → `ARMED` → `LOGGING` → `POSTFLIGHT` → `ERROR`
+  * States: `IDLE` → `ARMED` → `LOGGING` → `ERROR`
   * Manages session lifecycle and health metrics
   * Thread-safe access via mutex
-  
-* **No separate app_state module** - logger service is authoritative for operational state
 
+* **Sensor caches** (in respective services):
+  * **BARO**: last pressure/temp, altitude estimate, ground reference
+  * **GNSS**: last fix (position, velocity, time), RTC correlation
+  * **Orientation**: current quaternion (Fusion AHRS state)
 
-  * **IMU cache**: last calibrated gyro/accel vectors, FIFO watermarks.
-  * **BARO cache**: last pressure/temp & altitude estimate.
-  * **MAG cache** (optional): last B-field µT.
-  * **GNSS cache**: last fix (LLA, v/acc), RTC offset to monotonic.
-* **Session state (`session_state_t`)** (lifetime = active logging session):
+* **Session state** (in logger, lifetime = active logging session):
+  * `session_start_us` (monotonic timestamp)
+  * `session_dir` (path to session directory)
+  * File writer statistics (bytes, lines, flushes)
 
-  * `uuid`, `start_monotonic_us`, `start_utc` (from GNSS when available)
-  * `rates` (effective ODRs), version, axis conventions
-  * **file handles**: primary log file, (optional) sidecars (index, health)
-  * rolling counters: lines\_written, bytes\_written, dropped\_samples
+### 3.3 Filesystem state
 
-### 4.3 Filesystem state
-
-* **littlefs mount** on QSPI NOR (always V1).
-* Path scheme:
-  `"/lfs/logs/<YYYYMMDD>/<SESSION_UUID>/flight.txt"`
-  Optional sidecar: `"index.json"` (seek map) or `"health.json"` (drop counts).
+* **Primary**: SD Card with FAT/exFAT filesystem
+* **Fallback**: QSPI NOR with littlefs (optional)
+* **Path scheme**: `/SD:/logs/<YYYYMMDD>/<UUID>.txt`
+* **Date folders**: Created using GPS date when available
 
 ---
 
-## 5) Services — Responsibilities & Interfaces
+## 4) Services — Responsibilities & Interfaces
 
-### 5.1 `timebase`
+### 4.1 `timebase`
 
-* Provides `time_now_us()` (64-bit monotonic).
-* Maintains GNSS correlation (no PPS on V1): updated by GNSS sentences; exposes `utc_from_mono()` estimation used by `$PTH`.
-* Swap-in PPS discipline in V2 without changing API.
+* Provides `time_now_us()` (64-bit monotonic)
+* Maintains GNSS time correlation: updated by GNSS sentences
+* Sets system RTC (`CLOCK_REALTIME`) from GPS time for date-stamped directories
 
-### 5.2 `imu_icm42688`
+### 4.2 `imu_icm42688`
 
-* Configures ODR, full-scale ranges; enables FIFO + INT1.
-* SPI EasyDMA bursts on INT; calibrates & enqueues batches to ring buffer.
-* Exposes control hooks (`imu_set_mode()`) for **phase-aware rates**.
+* Configures ODR, full-scale ranges; enables FIFO + INT1
+* SPI bursts on INT; enqueues batches to aggregator ring buffer
+* **Status**: Hardware issues (WHO_AM_I mismatch) - not functional on current boards
 
-### 5.3 `baro_bmp390`
+### 4.3 `baro_bmp390`
 
-* Configures ODR; fires on DRDY IRQ or timer fallback.
-* Outputs pressure & sensor temperature; basic altitude estimate.
+* Configures ODR (default 8 Hz); fires on DRDY IRQ
+* Outputs pressure, temperature, and calculated altitude
+* Provides ground altitude reference for takeoff detection
+* Callback registration for logger (takeoff detection) and aggregator (logging)
 
-### 5.4 `mag_mmc5983ma` (optional)
+### 4.4 `gnss_m10q`
 
-* Periodic or INT-driven sampling; soft-iron calibration deferred (host/offline).
+* **UART async API** with ring buffer for received data
+* **Early quiet**: `gnss_early_quiet()` called at boot to silence module before full init
+* **NMEA parsing**: GGA, GLL, VTG sentences passed through to log
+* **UBX protocol**: Configuration commands (rate, dynamic model, message enable/disable)
+* **Dynamic model**: Airborne 4g for skydiving operations
+* **Rate control**: 1 Hz default, configurable up to 10 Hz
 
-### 5.5 `gnss_m10q`
+### 4.5 `orientation` + `fusion`
 
-* UART DMA reader; NMEA line framing; optional UBX for accuracy/velocity.
-* Publishes fixes; updates **timebase** correlation; triggers `$PTH` emission cadence.
+* **Fusion AHRS algorithm** (based on xioTechnologies/Fusion library)
+* IMU-only operation (no magnetometer)
+* Outputs quaternion orientation updated from IMU samples
+* Configurable gain and acceleration rejection thresholds
 
-###E 5.5 GNSS Service - Dynamic Rates
+### 4.6 `aggregator`
 
-* **Default**: 2 Hz (ground/climb)
-* **Freefall**: 10 Hz during LOGGING state
-* **Auto-adjustment**: Based on flight phase
-* **Buffer sizing**: 32 samples to handle rate bursts
+* **Ring buffers** for IMU (128 samples), BARO (32 samples), GNSS (32 fixes)
+* **NMEA sentence builder** with checksum calculation
+* **Output sentences**:
+  * `$PVER` - Version info at session start
+  * `$PSFC` - Surface/ground altitude
+  * `$PIMU` - IMU data (40 Hz when IMU working)
+  * `$PIM2` - Quaternion orientation (after each `$PIMU`)
+  * `$PENV` - Environmental data (4 Hz) - pressure, altitude, battery
+  * `$PTH` - Timestamp correlation (after GGA/GLL)
+  * `$PST` - State change events
+  * Raw GNSS: `$GxGGA`, `$GxGLL`, `$GxVTG` passthrough
+* **Work-based output**: Delayable work items for timed sentence emission
 
-### 5.6 `aggregator`
+### 4.7 `logger`
 
-* Pulls newest batches from IMU/BARO/MAG/GNSS.
-* Builds **NMEA `$Pxxx` sentences** exactly per V1 spec (with `*HH` checksums):
+* **Session state machine**: IDLE → ARMED → LOGGING → ERROR
+* **Takeoff detection**: Monitors barometer for climb rate and altitude change
+* **Session management**:
+  * Creates date-based directories using GPS date
+  * UUID-based filenames
+  * Writes header (PVER, PSFC) at session start
+* **Button control integration**: Armed/disarmed via long press, start/stop via short press
 
-  * `$PVER` (on start), `$PSFC` (session file config),
-  * `$PIMU` (40 Hz), `$PIM2` (quaternion after each `$PIMU`),
-  * `$PENV` (4 Hz), `$PTH` (after each GGA/VTG), `$PST` (state changes),
-  * `$PMAG` (optional) if magnetometer enabled.
-* Emits lines to **File Writer** queue.
+### 4.8 `file_writer`
 
-### 5.7 `logger`
+* **Simplified architecture**: Ring buffer + dedicated worker thread
+* **Static allocations**: 8KB ring buffer, 4KB write buffer, 1KB thread stack
+* **Async operation**: Data queued via `file_writer_write()`, flushed by worker
+* **Periodic flush**: Default 250ms interval
+* **Statistics**: Bytes written, lines, flushes, buffer overflows, write errors
 
-* Orchestrates session lifecycle: **start/stop**, file open/close, header emit
-* **Ground altitude tracking**: 
-  * Samples barometer every 5 minutes when IDLE/ARMED
-  * Records ground reference for takeoff detection
-  * Automatic takeoff detection based on climb rate and altitude change
-* Chooses **rate schedule** per phase
-* Applies **backpressure policy** (e.g., drop GNSS first if storage stalls).
-* Notifies **Upload** when a session is completed (optional auto-upload).
+### 4.9 Storage Backends
 
-### 5.8 `file_writer`
+* **Primary**: `storage_fatfs.c` - SD Card with FAT/exFAT
+  * Mount point: `/SD:`
+  * Auto-creates directory paths
+  * Card detect GPIO support
+* **Optional**: `storage_littlefs.c` - QSPI NOR flash
+* **Abstraction**: `storage.c` provides unified interface
 
-* Dedicated thread; drains sentence queue to append to active file.
-* Write coalescing (e.g., 1–4 KB) and timed flushes; tracks FS errors and signals `logger` on failure; ensures sync on session stop.
+### 4.10 `led`
 
-### 5.9 Storage Backends
+* **PWM-based RGB LED** control (3 channels)
+* **Blink pattern**: 50ms on, 2 second period
+* **State colors**:
+  * Blue: IDLE
+  * Orange: ARMED
+  * Green: LOGGING
+  * Red: ERROR
+* **Override support**: Temporary color override for status indication
 
-* **Planned**: SD Card via SPI with fallback to Internal QSPI flash with littlefs only
-* **Path**: Fixed at `/lfs/logs/` for littlefs mount
+### 4.11 BLE / mcumgr
 
-### 5.10 `upload_mcumgr`
-
-* Exposes **file list/get/delete** over BLE SMP (FS mgmt group).
-* Optional “virtual folder” namespacing to keep iOS client simple.
-* Shares file locks with `file_writer` to avoid concurrent writes.
-
-### 5.11 `dfu`
-
-* MCUboot image mgmt over SMP, gated by state (not during active logging).
-* Raises events for UI feedback (LED blinks, etc.).
-
-### 5.12 Custom mcumgr Commands (Group ID: 64)
-
-Beyond standard mcumgr file/image/OS management, Tempo-BT implements custom commands:
-
-* **Session List** (ID: 0): Returns JSON array of logging sessions with metadata
-* **Session Info** (ID: 1): Detailed info about a specific session
-* **Storage Info** (ID: 2): Storage statistics and health
-
-All commands use CBOR encoding per mcumgr standards.
-
-### 5.13 LED Service
-
-RGB LED provides system status:
-- **Blue pulse**: IDLE
-- **Green pulse**: ARMED  
-- **Red fast**: LOGGING
-- **Yellow**: File transfer active
-- **Magenta**: Error state
+* Standard mcumgr file transfer over BLE SMP
+* File list/get/delete operations
+* Dynamic device name support (`CONFIG_BT_DEVICE_NAME_DYNAMIC`)
 
 ---
 
-## 6) How Services Connect
+## 5) How Services Connect
 
-### 6.1 Data plane (samples → sentences → storage)
+### 5.1 Data plane (samples → sentences → storage)
 
 ```mermaid
 sequenceDiagram
-  participant IMU
   participant BARO
   participant GNSS
-  participant MAG
   participant AGG as Aggregator
+  participant Orient as Orientation
   participant WR as File Writer
-  participant FS as littlefs(QSPI)
+  participant SD as SD Card
 
-  IMU->>IMU: INT1 (FIFO watermark)
-  IMU->>AGG: push batch (ringbuf)
-  BARO->>AGG: push sample (ringbuf)
-  MAG->>AGG: push sample (optional)
-  GNSS->>AGG: GGA/VTG & time tie
+  BARO->>AGG: push sample (ring buffer)
+  GNSS->>AGG: NMEA passthrough + fix data
+  AGG->>Orient: IMU samples (when available)
+  Orient->>AGG: quaternion
 
-  AGG->>AGG: build $PIMU/$PIM2/$PENV/$PTH...
-  AGG->>WR: enqueue NMEA sentences
-  WR->>FS: append & flush policy
+  AGG->>AGG: build $PENV/$PTH/GNSS sentences
+  AGG->>WR: output callback (NMEA line)
+  WR->>WR: ring buffer enqueue
+  WR->>SD: worker thread flush
 ```
 
-### 6.2 Control plane (events & state)
+### 5.2 Control plane (events & state)
 
-* `events.c` exposes `event_bus_publish(evt)` and subscriber registration.
-* Producers: **logger**, **file\_writer**, **storage**, **dfu**, **upload**, **gnss**.
-* Consumers: **app\_state**, **aggregator** (for `$PST`), **UI**.
+* `events.c` exposes `event_bus_publish()` and subscriber registration
+* **Producers**: logger, storage, sensors
+* **Consumers**: LED service (state colors), aggregator (`$PST` sentences)
 
-**Typical events**
-
-**Typical events**
-* `EVT_SESSION_START/STOP`
-* `EVT_STATE_CHANGE` (replaces EVT_PHASE_CHANGE)
-* `EVT_STORAGE_LOW`, `EVT_STORAGE_ERROR`
-* `EVT_SENSOR_ERROR`
-* [removed EVT_MODE_CHANGE - redundant with STATE_CHANGE]
+**Event types:**
+* `EVT_MODE_CHANGE` - Logger state transitions
+* `EVT_STORAGE_ERROR` - SD card errors
+* `EVT_SENSOR_ERROR` - Sensor failures
+* `EVT_STORAGE_LOW` - Low storage warning
 
 ---
 
-## 7) Session Lifecycle (state machine)
+## 6) Session Lifecycle (state machine)
 
 ```mermaid
 stateDiagram-v2
     [*] --> IDLE
-    IDLE --> ARMED: long-press or iOS command
-    ARMED --> LOGGING: exit detected / user press
-    LOGGING --> POSTFLIGHT: canopy or land detected
-    POSTFLIGHT --> IDLE: file closed, (optional) upload queued
-    LOGGING --> ERROR: FS error / sensor fatal
-    ERROR --> IDLE: user ack / auto-recover
+    IDLE --> ARMED: long-press Button 0
+    ARMED --> IDLE: long-press Button 0
+    ARMED --> LOGGING: short-press or takeoff detected
+    LOGGING --> IDLE: short-press (manual stop)
+    LOGGING --> ERROR: storage/sensor error
+    ERROR --> IDLE: recovery
 ```
 
-Arming Methods:
-- Manual: Long button press or BLE command
-- Auto: Takeoff detection (altitude/acceleration threshold)
+**Button Controls (main.c):**
+- **Button 0 long press** (2 seconds): Toggle IDLE ↔ ARMED
+- **Button 0 short press**: Start logging (when ARMED) or stop logging (when LOGGING)
+- **Button 1**: Reserved for future use
+
+**Automatic Takeoff Detection:**
+- Monitors barometer climb rate and altitude change
+- Triggers ARMED → LOGGING transition automatically
+- Configurable via `auto_start_on_takeoff` in logger config
 
 Transitions emit `$PST` records with trigger reasons.
 
 ---
 
-## 8) Logging Format Strategy (compatibility first)
+## 7) Logging Format
 
-* Preserve **existing NMEA checksum** `$Pxxx` lines & **cadence** to keep tooling stable.
-* Additions are **optional** sentences (e.g., `$PMAG`) that legacy parsers can ignore.
-* File begins with `$PVER`, `$PSFC`; consider one-shot `$PMETA` for firmware, ODRs, axes.
-* iOS app can parse lines incrementally; integrity checks via per-line checksum and (optionally) a final file hash stored in a tiny sidecar.
+Uses **NMEA-style** `$Pxxx` proprietary sentences with checksums.
 
-### 8) Logging Format - Modifications to the original Dropkick format
+### Sentence Types
 
-Current implementation uses original **Dropkick / Tempo** format:
-* `$PVER` - Version string with device type
-* `$PSFC` - Surface altitude  
-* `$PIMU` - IMU data (40 Hz) [planned]
-* `$PIM2` - Orientation Quaternion [planned]
-* `$PENV` - Environmental data (4 Hz)
-* `$PTH` - Time correlation after GNSS sentences
-* `$PST` - State changes
-* `$G*GLL` - GNSS fix sentence
-* `$G*GGA` - GNSS fix / precision tracking sentence
-* `$G*VTG` - GNSS Track Made Good sentence
-  
-* **$PVER** enhanced: Now includes GPS date
-  * Format: `$PVER,<version>,<device>,<firmware>,<date>*HH`
-  * Example: `$PVER,1.0,V1,0.1.0,2025-01-15*CD`
+| Sentence | Rate | Description |
+|----------|------|-------------|
+| `$PVER` | Once | Version info: `"Tempo V1 <version> (<git>)",<numeric>` |
+| `$PSFC` | Once | Surface/ground altitude in feet |
+| `$PIMU` | 40 Hz | Accel (m/s²) + gyro (rad/s) - when IMU working |
+| `$PIM2` | 40 Hz | Quaternion (w,x,y,z) - after each PIMU |
+| `$PENV` | 4 Hz | Pressure (hPa), altitude (ft), battery (V) |
+| `$PTH` | Per fix | Timestamp correlation (ms since session start) |
+| `$PST` | Events | State change: old_state, new_state, trigger |
+| `$GxGGA` | 1 Hz | GNSS fix (passthrough) |
+| `$GxGLL` | 1 Hz | GNSS position (passthrough) |
+| `$GxVTG` | 1 Hz | GNSS velocity (passthrough) |
 
-* **$PFIX** (considered, but not implemented in this version): Consolidated GPS fix data
-  * Format: `$PFIX,<timestamp_ms>,<utc_time>,<lat>,<lon>,<alt>,<fix_quality>,<hdop>,<vdop>*HH`
-  * Example: `$PFIX,123456,2025-01-15T12:34:56.789Z,37.7749,-122.4194,10.5,3,1.2,1.5*AB`
+### Checksum Format
+
+All sentences end with `*HH\r\n` where HH is XOR checksum of characters between `$` and `*`.
 
 ---
 
-## 9) Error Handling & Backpressure
+## 8) Error Handling
 
-* **Ring buffers sized** for worst-case storage stall (e.g., 2–3 s).
-* Drop policy: GNSS → MAG → BARO → IMU last; counters recorded to `health.json`.
-* Writer detects FS errors; raises `EVT_STORAGE_ERROR`; `logger` transitions to `ERROR` or graceful stop depending on severity.
-* Brown-out safety: littlefs is crash-tolerant; writer syncs on phase changes and session stop.
-
----
-
-## 10) Build Targets & Profiles
-
-* **V1 Hardware**: `-DBOARD=nrf5340dk_nrf5340_cpuapp -DOVERLAY_CONFIG=boards/.../tempo_v1.conf -DDTC_OVERLAY_FILE=boards/.../tempo_v1.overlay`
-* **Profiles**:
-
-  * `debug`: RTT logs, asserts, larger stacks.
-  * `flight`: logs minimal, power mgmt enabled, heap reduced, watchdog on.
+* **Ring buffer overflow**: Tracked in file_writer stats; logged as warning
+* **Storage errors**: Trigger `EVT_STORAGE_ERROR`; logger transitions to ERROR state
+* **Sync policy**: Writer syncs after each flush; final sync on file close
+* **GNSS buffer overrun**: Mitigated by `gnss_early_quiet()` at boot
 
 ---
 
-### 11) BLE Transfer Performance
+## 9) Implementation Status
 
-* **mcumgr over BLE**: 100-200 KB/s typical
-* **Chunk size**: 512 bytes optimal
-* **Connection parameters**: Optimized for throughput
-* **iOS compatibility**: nRF Connect, custom apps via mcumgr
+### Working
+- ✓ SD Card storage (FAT/exFAT)
+- ✓ BLE file transfer (mcumgr)
+- ✓ BMP390 barometer (8 Hz, takeoff detection)
+- ✓ SAM-M10Q GNSS (1-10 Hz, UBX config, airborne 4g mode)
+- ✓ Orientation tracking (Fusion AHRS - ready for IMU)
+- ✓ Logger state machine (IDLE/ARMED/LOGGING/ERROR)
+- ✓ Button controls (short/long press)
+- ✓ RGB LED status indication
+- ✓ Event bus for state notifications
+- ✓ Date-stamped log directories (GPS date)
+- ✓ Async file writer (ring buffer + worker thread)
+
+### Not Working / Pending
+- ✗ ICM42688 IMU (hardware WHO_AM_I mismatch)
+- ✗ MMC5983MA magnetometer (not integrated)
+- ✗ Advanced flight phase detection
+- ✗ Auto-landing detection
 
 ---
 
-### UI Controls
+## 10) Key Configuration (prj.conf)
 
-Button 1:
-- **Short press**: Start/stop logging (when armed)
-- **Long press** (3s): Arm/disarm toggle
+```conf
+# Heap for dynamic allocations
+CONFIG_HEAP_MEM_POOL_SIZE=32768
 
-Button 2: Reserved for future use
+# BLE with dynamic device name
+CONFIG_BT_DEVICE_NAME_DYNAMIC=y
+CONFIG_BT_DEVICE_NAME_MAX=32
+
+# Filesystem
+CONFIG_FILE_SYSTEM=y
+CONFIG_FAT_FILESYSTEM_ELM=y
+CONFIG_DISK_ACCESS=y
+
+# UART async for GNSS
+CONFIG_UART_ASYNC_API=y
+```
 
 ---
 
-## Implementation Status (V1 board)
+## TL;DR
 
-Implemented:
-- Core logging to QSPI Flash (littlefs)
-- BLE file transfer via mcumgr
-- Barometer integration with takeoff detection
-- GNSS integration (2-10 Hz dynamic)
-- State machine with auto-detection
-- LED status indicators
-- Button controls
-- SD Card support
-
-Pending/In Progress:
-- IMU integration (hardware issues)
-- Magnetometer integration
-- Custom mcumgr commands
-- Advanced flight phase detection
----
-
-### TL;DR (mental model)
-
-* Keep **drivers small** and **stateless** (push samples).
-* Keep **state** in `app_state` (system) + `session_state` (per-logging).
-* Route **data** through ring buffers → **Aggregator** → **File Writer** → **littlefs**.
-* Do **control & health** on the **event bus**.
-* Use **smpmgr** for server/iOS file pulls + DFU now; swap later only if necessary (the Linux **mcumgr** app proved inadequate)
-
-This structure lets you compile clean V1 firmware that reproduces your current NMEA logs line-for-line while being future-proof for PPS, SD cards, or a custom BLE file service.
+* **Logger service** owns system state (IDLE → ARMED → LOGGING)
+* **Aggregator** builds NMEA sentences from sensor ring buffers
+* **File writer** uses Zephyr ring buffer + worker thread for async I/O
+* **GNSS** provides position + time; early quiet prevents boot overruns
+* **Barometer** provides altitude + takeoff detection
+* **Orientation** ready for IMU data (Fusion AHRS algorithm)
+* **Button 0** controls arming (long) and start/stop (short)
+* **LED** indicates state via color (blue=idle, orange=armed, green=logging, red=error)

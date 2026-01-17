@@ -94,7 +94,7 @@ static uint64_t get_session_start_us(void);
 
 /* UART configuration */
 #define GNSS_UART_NODE DT_NODELABEL(uart2)
-#define GNSS_UART_BUFFER_SIZE 128
+#define GNSS_UART_BUFFER_SIZE 256
 #define GNSS_RX_TIMEOUT_US 100000  /* 100ms timeout */
 
 /* UART device and buffers */
@@ -163,9 +163,14 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
         
     case UART_RX_STOPPED:
         LOG_ERR("UART RX stopped due to error: %d", evt->data.rx_stop.reason);
-        /* Try to restart */
-        k_msleep(10);
-        uart_rx_enable(uart_dev, uart_rx_buf, GNSS_UART_BUFFER_SIZE, 
+        /* Clear ring buffer on overrun to prevent continuous errors */
+        if (evt->data.rx_stop.reason == 4) {  /* UART_ERROR_OVERRUN */
+            ring_buf_reset(&rx_ring_buf);
+            LOG_WRN("Ring buffer cleared due to overrun");
+        }
+        /* Try to restart with longer delay */
+        k_msleep(50);
+        uart_rx_enable(uart_dev, uart_rx_buf, GNSS_UART_BUFFER_SIZE,
                        GNSS_RX_TIMEOUT_US);
         break;
         
@@ -396,7 +401,7 @@ static void parse_gga(const char *sentence)
             current_fix.latitude, current_fix.longitude,
             current_fix.altitude);
 
-    update_system_time_from_fix();
+    /* Don't call update_system_time_from_fix() here - GGA doesn't contain date */
 }
 
 /* Updated parse_vtg function using robust tokenizer */
@@ -692,6 +697,132 @@ static void gnss_thread(void *p1, void *p2, void *p3)
 K_THREAD_DEFINE(gnss_thread_id, 4096, gnss_thread, NULL, NULL, NULL,
                 7, 0, 0);
 
+/*
+ * Early GNSS quiet function - call very early in boot sequence.
+ * This disables NMEA output and drains any pending data to prevent
+ * buffer overruns when the GNSS module continues running after CPU reset.
+ */
+int gnss_early_quiet(void)
+{
+    const struct device *dev;
+    int ret;
+
+    LOG_INF("GNSS early quiet: silencing module");
+
+    /* Get UART device */
+    dev = DEVICE_DT_GET(GNSS_UART_NODE);
+    if (!device_is_ready(dev)) {
+        LOG_WRN("GNSS UART not ready for early quiet");
+        return -ENODEV;
+    }
+
+    /* Configure UART for polling mode (no async callbacks yet) */
+    struct uart_config cfg = {
+        .baudrate = 9600,
+        .parity = UART_CFG_PARITY_NONE,
+        .stop_bits = UART_CFG_STOP_BITS_1,
+        .data_bits = UART_CFG_DATA_BITS_8,
+        .flow_ctrl = UART_CFG_FLOW_CTRL_NONE
+    };
+
+    ret = uart_configure(dev, &cfg);
+    if (ret < 0) {
+        LOG_WRN("Failed to configure UART for early quiet: %d", ret);
+        /* Continue anyway - might work with existing config */
+    }
+
+    /* Drain any pending RX data (polling mode) */
+    uint8_t dummy;
+    int drained = 0;
+    while (uart_poll_in(dev, &dummy) == 0 && drained < 2048) {
+        drained++;
+    }
+    if (drained > 0) {
+        LOG_INF("GNSS early quiet: drained %d bytes", drained);
+    }
+
+    /*
+     * Send UBX-CFG-MSG commands to disable all standard NMEA messages.
+     * This uses polling mode TX since async isn't set up yet.
+     * Format: UBX-CFG-MSG with rate=0 for UART1
+     */
+
+    /* UBX-CFG-MSG to disable GGA (0xF0 0x00) */
+    static const uint8_t disable_gga[] = {
+        0xB5, 0x62,             /* UBX sync */
+        0x06, 0x01,             /* CFG-MSG class/id */
+        0x08, 0x00,             /* Length = 8 */
+        0xF0, 0x00,             /* NMEA-GGA message */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* Rates for 6 ports (all 0) */
+        0xFF, 0x23              /* Checksum (placeholder) */
+    };
+
+    /* UBX-CFG-MSG to disable GLL (0xF0 0x01) */
+    static const uint8_t disable_gll[] = {
+        0xB5, 0x62, 0x06, 0x01, 0x08, 0x00,
+        0xF0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x2A
+    };
+
+    /* UBX-CFG-MSG to disable GSA (0xF0 0x02) */
+    static const uint8_t disable_gsa[] = {
+        0xB5, 0x62, 0x06, 0x01, 0x08, 0x00,
+        0xF0, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x31
+    };
+
+    /* UBX-CFG-MSG to disable GSV (0xF0 0x03) */
+    static const uint8_t disable_gsv[] = {
+        0xB5, 0x62, 0x06, 0x01, 0x08, 0x00,
+        0xF0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02, 0x38
+    };
+
+    /* UBX-CFG-MSG to disable RMC (0xF0 0x04) */
+    static const uint8_t disable_rmc[] = {
+        0xB5, 0x62, 0x06, 0x01, 0x08, 0x00,
+        0xF0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x03, 0x3F
+    };
+
+    /* UBX-CFG-MSG to disable VTG (0xF0 0x05) */
+    static const uint8_t disable_vtg[] = {
+        0xB5, 0x62, 0x06, 0x01, 0x08, 0x00,
+        0xF0, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x04, 0x46
+    };
+
+    /* Send disable commands using poll_out */
+    const uint8_t *cmds[] = {
+        disable_gga, disable_gll, disable_gsa,
+        disable_gsv, disable_rmc, disable_vtg
+    };
+    const size_t cmd_lens[] = {16, 16, 16, 16, 16, 16};
+
+    for (int i = 0; i < 6; i++) {
+        for (size_t j = 0; j < cmd_lens[i]; j++) {
+            uart_poll_out(dev, cmds[i][j]);
+        }
+        /* Small delay between commands */
+        k_busy_wait(1000);  /* 1ms */
+    }
+
+    /* Wait a bit for commands to be processed */
+    k_msleep(50);
+
+    /* Drain any response/remaining data */
+    drained = 0;
+    while (uart_poll_in(dev, &dummy) == 0 && drained < 1024) {
+        drained++;
+    }
+    if (drained > 0) {
+        LOG_INF("GNSS early quiet: drained %d more bytes after quiet commands", drained);
+    }
+
+    LOG_INF("GNSS early quiet: complete");
+    return 0;
+}
+
 int gnss_init(void)
 {
     int ret;
@@ -857,17 +988,15 @@ static void update_system_time_from_fix(void)
     struct tm time_tm;
 
     //LOG_INF("Attempting to update system time from GNSS fix: %d %d", current_fix.date_valid, current_fix.time_valid);
-    
+
     /* Check if we have valid date AND time */
-    if (current_fix.date_valid && current_fix.time_valid) {
-        return;
+    if (!current_fix.date_valid || !current_fix.time_valid) {
+        return;  /* Need both valid date and time */
     }
     
     /* Check if we've already set the time this session */
     static bool time_set = false;
     if (time_set) {
-        current_fix.date_valid = false; 
-        current_fix.time_valid = false;
         return;  /* Only set once per boot */
     }
     
@@ -906,15 +1035,13 @@ static void update_system_time_from_fix(void)
                 current_fix.year, current_fix.month, current_fix.day,
                 current_fix.hours, current_fix.minutes, current_fix.seconds,
                 current_fix.milliseconds);
-                
+
         /* Also update the global date string used by aggregator */
         extern char gps_date_string[14];
-        snprintf(gps_date_string, sizeof(gps_date_string), 
+        snprintf(gps_date_string, sizeof(gps_date_string),
                  "%04d-%02d-%02d", current_fix.year, current_fix.month, current_fix.day);
     } else {
         LOG_ERR("Failed to set system time: %d", ret);
-        current_fix.date_valid = false; 
-        current_fix.time_valid = false;
     }
 }
 
