@@ -195,14 +195,34 @@ int gnss_set_nav5_config(const struct ubx_cfg_nav5 *config);
 
 /**
  * @brief Configure GNSS for skydiving use
- * 
+ *
  * Sets optimal configuration for skydiving:
  * - Dynamic model: Airborne 4g
  * - Update rate: 1Hz (will be increased during freefall)
- * 
+ *
  * @return 0 on success, negative error code on failure
  */
 int gnss_init_skydiving(void);
 
+/**
+ * @brief Set session start time for NMEA timestamping
+ *
+ * @param start_us Session start time in microseconds
+ */
+void gnss_set_session_start_time(uint64_t start_us);
+
+#ifdef CONFIG_GNSS_TEST_MODE
+/**
+ * @brief Test UBX communication with GNSS module
+ *
+ * Runs a series of tests to validate UBX binary protocol communication:
+ * - TX completion tracking (no EBUSY errors)
+ * - UBX message framing and checksum
+ * - ACK/NAK response parsing
+ *
+ * @return 0 if all tests pass, negative error code if any fail
+ */
+int gnss_test_ubx_communication(void);
+#endif
 
 #endif /* SERVICES_GNSS_H */

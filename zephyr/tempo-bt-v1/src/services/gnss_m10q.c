@@ -64,6 +64,37 @@ static struct {
     uint8_t waiting_id;
 } ubx_ack_state;
 
+/* UART TX completion tracking */
+static struct {
+    struct k_sem done;
+    int result;
+} uart_tx_state;
+
+/* UBX parser state machine */
+typedef enum {
+    UBX_STATE_SYNC_SEARCH,
+    UBX_STATE_SYNC2,
+    UBX_STATE_CLASS,
+    UBX_STATE_ID,
+    UBX_STATE_LEN_L,
+    UBX_STATE_LEN_H,
+    UBX_STATE_PAYLOAD,
+    UBX_STATE_CK_A,
+    UBX_STATE_CK_B
+} ubx_parse_state_t;
+
+/* UBX receive parser state */
+static struct {
+    ubx_parse_state_t state;
+    uint8_t msg_class;
+    uint8_t msg_id;
+    uint16_t length;
+    uint8_t payload[64];    /* ACK messages only need 2 bytes, but allow some margin */
+    uint16_t payload_idx;
+    uint8_t ck_a, ck_b;     /* Received checksums */
+    uint8_t calc_ck_a, calc_ck_b;  /* Calculated checksums */
+} ubx_rx;
+
 /* UBX-CFG-NAV5 message structure */
 struct ubx_cfg_nav5 {
     uint16_t mask;              /* Parameters bitmask */
@@ -127,8 +158,21 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 {
     ARG_UNUSED(user_data);
     static uint8_t *next_buf = uart_rx_buf2;
-    
+
     switch (evt->type) {
+    case UART_TX_DONE:
+        /* TX buffer has been sent */
+        uart_tx_state.result = 0;
+        k_sem_give(&uart_tx_state.done);
+        break;
+
+    case UART_TX_ABORTED:
+        /* TX was aborted */
+        LOG_WRN("UART TX aborted");
+        uart_tx_state.result = -EIO;
+        k_sem_give(&uart_tx_state.done);
+        break;
+
     case UART_RX_RDY:
         /* Data ready, add to ring buffer */
         if (evt->data.rx.len > 0) {
@@ -603,6 +647,156 @@ static void parse_rmc(const char *sentence)
     update_system_time_from_fix();
 }
 
+/*
+ * UBX Binary Protocol Parser
+ */
+
+/* Reset UBX parser to initial state */
+static void ubx_reset_parser(void)
+{
+    ubx_rx.state = UBX_STATE_SYNC_SEARCH;
+    ubx_rx.payload_idx = 0;
+    ubx_rx.length = 0;
+    ubx_rx.calc_ck_a = 0;
+    ubx_rx.calc_ck_b = 0;
+}
+
+/* Update running checksum with a byte */
+static inline void ubx_update_rx_checksum(uint8_t byte)
+{
+    ubx_rx.calc_ck_a += byte;
+    ubx_rx.calc_ck_b += ubx_rx.calc_ck_a;
+}
+
+/* Handle a complete UBX message */
+static void ubx_handle_message(void)
+{
+    if (ubx_rx.msg_class == UBX_CLASS_ACK) {
+        if (ubx_rx.msg_id == UBX_ID_ACK_ACK) {
+            /* ACK-ACK: positive acknowledgement */
+            if (ubx_rx.length >= 2) {
+                uint8_t ack_class = ubx_rx.payload[0];
+                uint8_t ack_id = ubx_rx.payload[1];
+
+                LOG_INF("UBX-ACK-ACK: class=0x%02X id=0x%02X", ack_class, ack_id);
+
+                /* Check if this matches what we're waiting for */
+                if (ack_class == ubx_ack_state.waiting_class &&
+                    ack_id == ubx_ack_state.waiting_id) {
+                    ubx_ack_state.ack_received = true;
+                    k_sem_give(&ubx_ack_state.sem);
+                }
+            }
+        } else if (ubx_rx.msg_id == UBX_ID_ACK_NAK) {
+            /* ACK-NAK: negative acknowledgement */
+            if (ubx_rx.length >= 2) {
+                uint8_t nak_class = ubx_rx.payload[0];
+                uint8_t nak_id = ubx_rx.payload[1];
+
+                LOG_WRN("UBX-ACK-NAK: class=0x%02X id=0x%02X", nak_class, nak_id);
+
+                /* Check if this matches what we're waiting for */
+                if (nak_class == ubx_ack_state.waiting_class &&
+                    nak_id == ubx_ack_state.waiting_id) {
+                    ubx_ack_state.nak_received = true;
+                    k_sem_give(&ubx_ack_state.sem);
+                }
+            }
+        }
+    }
+    /* Other message classes (NAV, MON, etc.) can be handled here in future */
+}
+
+/* Process a single byte through the UBX parser state machine */
+static void ubx_process_byte(uint8_t byte)
+{
+    switch (ubx_rx.state) {
+    case UBX_STATE_SYNC_SEARCH:
+        if (byte == UBX_SYNC1) {
+            ubx_rx.state = UBX_STATE_SYNC2;
+        }
+        break;
+
+    case UBX_STATE_SYNC2:
+        if (byte == UBX_SYNC2) {
+            ubx_rx.state = UBX_STATE_CLASS;
+            ubx_rx.calc_ck_a = 0;
+            ubx_rx.calc_ck_b = 0;
+        } else if (byte == UBX_SYNC1) {
+            /* Stay in SYNC2 state - might be another sync sequence */
+            ubx_rx.state = UBX_STATE_SYNC2;
+        } else {
+            /* False sync, go back to searching */
+            ubx_reset_parser();
+        }
+        break;
+
+    case UBX_STATE_CLASS:
+        ubx_rx.msg_class = byte;
+        ubx_update_rx_checksum(byte);
+        ubx_rx.state = UBX_STATE_ID;
+        break;
+
+    case UBX_STATE_ID:
+        ubx_rx.msg_id = byte;
+        ubx_update_rx_checksum(byte);
+        ubx_rx.state = UBX_STATE_LEN_L;
+        break;
+
+    case UBX_STATE_LEN_L:
+        ubx_rx.length = byte;  /* LSB */
+        ubx_update_rx_checksum(byte);
+        ubx_rx.state = UBX_STATE_LEN_H;
+        break;
+
+    case UBX_STATE_LEN_H:
+        ubx_rx.length |= ((uint16_t)byte << 8);  /* MSB */
+        ubx_update_rx_checksum(byte);
+
+        if (ubx_rx.length > sizeof(ubx_rx.payload)) {
+            LOG_WRN("UBX message too long: %u bytes", ubx_rx.length);
+            ubx_reset_parser();
+        } else if (ubx_rx.length == 0) {
+            /* Empty payload, go straight to checksum */
+            ubx_rx.state = UBX_STATE_CK_A;
+        } else {
+            ubx_rx.payload_idx = 0;
+            ubx_rx.state = UBX_STATE_PAYLOAD;
+        }
+        break;
+
+    case UBX_STATE_PAYLOAD:
+        ubx_rx.payload[ubx_rx.payload_idx++] = byte;
+        ubx_update_rx_checksum(byte);
+
+        if (ubx_rx.payload_idx >= ubx_rx.length) {
+            ubx_rx.state = UBX_STATE_CK_A;
+        }
+        break;
+
+    case UBX_STATE_CK_A:
+        ubx_rx.ck_a = byte;
+        ubx_rx.state = UBX_STATE_CK_B;
+        break;
+
+    case UBX_STATE_CK_B:
+        ubx_rx.ck_b = byte;
+
+        /* Message complete: validate checksum and process */
+        if (ubx_rx.ck_a == ubx_rx.calc_ck_a &&
+            ubx_rx.ck_b == ubx_rx.calc_ck_b) {
+            ubx_handle_message();
+        } else {
+            LOG_WRN("UBX checksum mismatch: got %02X %02X, calc %02X %02X",
+                    ubx_rx.ck_a, ubx_rx.ck_b,
+                    ubx_rx.calc_ck_a, ubx_rx.calc_ck_b);
+        }
+
+        ubx_reset_parser();
+        break;
+    }
+}
+
 /* Process NMEA sentence by type */
 static void process_nmea_sentence(const char *sentence, size_t len)
 {
@@ -623,56 +817,72 @@ static void process_nmea_sentence(const char *sentence, size_t len)
     }
 }
 
-/* Process received data from ring buffer */
+/* Process received data from ring buffer - demux UBX and NMEA */
 static void process_uart_data(void)
 {
     uint8_t byte;
-    
+
     while (ring_buf_get(&rx_ring_buf, &byte, 1) == 1) {
-        /* Capture arrival time at start of NMEA sentence */
-        if (byte == '$' && nmea_line_pos == 0) {
+        /*
+         * Demux logic: route bytes to UBX or NMEA parser
+         * - If we're mid-UBX message, continue UBX parsing
+         * - If we see UBX sync (0xB5), start UBX parsing
+         * - If we see NMEA start ($), start NMEA parsing
+         */
+        if (ubx_rx.state != UBX_STATE_SYNC_SEARCH) {
+            /* We're in the middle of parsing a UBX message */
+            ubx_process_byte(byte);
+        } else if (byte == UBX_SYNC1) {
+            /* Potential UBX message start */
+            ubx_process_byte(byte);
+        } else if (byte == '$') {
+            /* NMEA sentence start */
             nmea_arrival_time_us = time_now_us();
-        }
-        
-        /* Check for line termination (CR or LF) */
-        if (byte == '\r' || byte == '\n') {
+            nmea_line_pos = 0;
+            nmea_line_buf[nmea_line_pos++] = byte;
+        } else if (byte == '\r' || byte == '\n') {
+            /* NMEA line terminator */
             if (nmea_line_pos > 0) {
                 /* Null terminate the line */
                 nmea_line_buf[nmea_line_pos] = '\0';
-                
+
                 /* Validate checksum */
                 if (validate_nmea_checksum((char *)nmea_line_buf, nmea_line_pos)) {
                     LOG_DBG("NMEA valid: %s", nmea_line_buf);
-                    
+
                     /* Process specific sentence types */
                     process_nmea_sentence((char *)nmea_line_buf, nmea_line_pos);
-                    
+
                     /* Call NMEA callback if registered - pass full sentence with CRLF */
                     if (nmea_callback) {
                         /* Restore CRLF for logging */
                         nmea_line_buf[nmea_line_pos] = '\r';
                         nmea_line_buf[nmea_line_pos + 1] = '\n';
                         nmea_line_buf[nmea_line_pos + 2] = '\0';
-                        
+
                         /* Pass arrival time in milliseconds relative to session start */
                         uint32_t arrival_ms = (uint32_t)((nmea_arrival_time_us - get_session_start_us()) / 1000);
+                        (void)arrival_ms;  /* Currently unused but available */
                         nmea_callback((char *)nmea_line_buf, nmea_line_pos + 2);
                     }
                 } else {
                     LOG_WRN("NMEA checksum failed: %s", nmea_line_buf);
                 }
-                
+
                 /* Reset line buffer */
                 nmea_line_pos = 0;
             }
-        } else if (nmea_line_pos < sizeof(nmea_line_buf) - 3) {  /* Leave room for CRLF and null */
-            /* Add byte to line buffer */
-            nmea_line_buf[nmea_line_pos++] = byte;
-        } else {
-            /* Line too long, discard and start over */
-            LOG_WRN("NMEA line too long, discarding");
-            nmea_line_pos = 0;
+        } else if (nmea_line_pos > 0) {
+            /* Continue NMEA line */
+            if (nmea_line_pos < sizeof(nmea_line_buf) - 3) {  /* Leave room for CRLF and null */
+                nmea_line_buf[nmea_line_pos++] = byte;
+            } else {
+                /* Line too long, discard and start over */
+                LOG_WRN("NMEA line too long, discarding");
+                nmea_line_pos = 0;
+            }
         }
+        /* Else: stray byte before any sync prefix, ignore */
     }
 }
 
@@ -869,36 +1079,45 @@ int gnss_init(void)
     
     /* Initialize ring buffer */
     ring_buf_init(&rx_ring_buf, sizeof(ring_buffer_mem), ring_buffer_mem);
-    
+
     /* Initialize mutex */
     k_mutex_init(&fix_mutex);
-    
+
     /* Initialize fix data */
     memset(&current_fix, 0, sizeof(current_fix));
-    
+
+    /* Initialize UBX parser */
+    ubx_reset_parser();
+
+    /* Initialize TX completion semaphore */
+    k_sem_init(&uart_tx_state.done, 0, 1);
+    uart_tx_state.result = 0;
+
+    /* Initialize ACK tracking semaphore */
+    k_sem_init(&ubx_ack_state.sem, 0, 1);
+    ubx_ack_state.ack_received = false;
+    ubx_ack_state.nak_received = false;
+    ubx_ack_state.waiting_class = 0;
+    ubx_ack_state.waiting_id = 0;
+
     /* Set up async UART */
     ret = uart_callback_set(uart_dev, uart_cb, NULL);
     if (ret < 0) {
         LOG_ERR("Failed to set UART callback: %d", ret);
         return ret;
     }
-    
+
     /* Start receiving */
-    ret = uart_rx_enable(uart_dev, uart_rx_buf, sizeof(uart_rx_buf), 
+    ret = uart_rx_enable(uart_dev, uart_rx_buf, sizeof(uart_rx_buf),
                          GNSS_RX_TIMEOUT_US);
     if (ret < 0) {
         LOG_ERR("Failed to enable UART RX: %d", ret);
         return ret;
     }
-    
-    LOG_INF("GNSS initialized on %s at %d baud", 
+
+    LOG_INF("GNSS initialized on %s at %d baud",
             uart_dev->name, cfg.baudrate);
-    
-    /* Send a test command to check communication */
-    const char *test_cmd = "$PUBX,00*33\r\n";  /* UBX poll position */
-    uart_tx(uart_dev, (uint8_t *)test_cmd, strlen(test_cmd), SYS_FOREVER_US);
-    LOG_INF("Sent GNSS test command");
-    
+
     return 0;
 }
 
@@ -1214,12 +1433,41 @@ int gnss_save_config(void)
     return 0;
 }
 
+/*
+ * UART TX helper - send data and wait for completion
+ * This prevents EBUSY errors from overlapping transmissions
+ */
+static int uart_tx_wait(const uint8_t *data, size_t len, k_timeout_t timeout)
+{
+    int ret;
+
+    /* Reset TX state */
+    k_sem_reset(&uart_tx_state.done);
+    uart_tx_state.result = -EBUSY;
+
+    /* Start transmission */
+    ret = uart_tx(uart_dev, data, len, SYS_FOREVER_MS);
+    if (ret < 0) {
+        LOG_ERR("uart_tx failed: %d", ret);
+        return ret;
+    }
+
+    /* Wait for TX completion callback */
+    ret = k_sem_take(&uart_tx_state.done, timeout);
+    if (ret < 0) {
+        LOG_ERR("TX timeout waiting for completion");
+        return -ETIMEDOUT;
+    }
+
+    return uart_tx_state.result;
+}
+
 /* Helper function to calculate UBX checksum */
 static void ubx_checksum(const uint8_t *data, size_t len, uint8_t *ck_a, uint8_t *ck_b)
 {
     *ck_a = 0;
     *ck_b = 0;
-    
+
     for (size_t i = 0; i < len; i++) {
         *ck_a += data[i];
         *ck_b += *ck_a;
@@ -1227,13 +1475,13 @@ static void ubx_checksum(const uint8_t *data, size_t len, uint8_t *ck_a, uint8_t
 }
 
 /* Send UBX message and wait for ACK */
-static int ubx_send_with_ack(uint8_t msg_class, uint8_t msg_id, 
+static int ubx_send_with_ack(uint8_t msg_class, uint8_t msg_id,
                              const uint8_t *payload, size_t payload_len)
 {
     uint8_t buffer[256];
     size_t idx = 0;
     int ret;
-    
+
     /* Build UBX message */
     buffer[idx++] = UBX_SYNC1;
     buffer[idx++] = UBX_SYNC2;
@@ -1241,45 +1489,46 @@ static int ubx_send_with_ack(uint8_t msg_class, uint8_t msg_id,
     buffer[idx++] = msg_id;
     buffer[idx++] = payload_len & 0xFF;
     buffer[idx++] = (payload_len >> 8) & 0xFF;
-    
+
     /* Copy payload */
     if (payload && payload_len > 0) {
         memcpy(&buffer[idx], payload, payload_len);
         idx += payload_len;
     }
-    
+
     /* Calculate checksum */
     uint8_t ck_a, ck_b;
     ubx_checksum(&buffer[2], idx - 2, &ck_a, &ck_b);
     buffer[idx++] = ck_a;
     buffer[idx++] = ck_b;
-    
-    /* Initialize ACK tracking */
-    k_sem_init(&ubx_ack_state.sem, 0, 1);
+
+    /* Initialize ACK tracking BEFORE sending */
+    k_sem_reset(&ubx_ack_state.sem);
     ubx_ack_state.ack_received = false;
     ubx_ack_state.nak_received = false;
     ubx_ack_state.waiting_class = msg_class;
     ubx_ack_state.waiting_id = msg_id;
-    
-    /* Send message */
-    ret = uart_tx(uart_dev, buffer, idx, SYS_FOREVER_MS);
+
+    /* Send message and wait for TX completion */
+    ret = uart_tx_wait(buffer, idx, K_MSEC(500));
     if (ret < 0) {
         LOG_ERR("Failed to send UBX message: %d", ret);
         return ret;
     }
-    
-    /* Wait for ACK/NAK */
+
+    /* Wait for ACK/NAK response from receiver */
     ret = k_sem_take(&ubx_ack_state.sem, K_MSEC(UBX_ACK_TIMEOUT_MS));
     if (ret < 0) {
         LOG_ERR("UBX ACK timeout for class=0x%02X id=0x%02X", msg_class, msg_id);
         return -ETIMEDOUT;
     }
-    
+
     if (ubx_ack_state.nak_received) {
         LOG_ERR("UBX NAK received for class=0x%02X id=0x%02X", msg_class, msg_id);
         return -EACCES;
     }
-    
+
+    LOG_DBG("UBX command successful: class=0x%02X id=0x%02X", msg_class, msg_id);
     return 0;
 }
 
@@ -1404,13 +1653,10 @@ int gnss_init_skydiving(void)
     if (ret < 0) {
         LOG_WRN("Failed to set 1Hz rate: %d", ret);
     }
-    
-    /* Save configuration to non-volatile memory */
-    ret = gnss_save_config();
-    if (ret < 0) {
-        LOG_WRN("Failed to save configuration: %d", ret);
-    }
-    
+
+    /* Note: SAM-M10Q OTP memory can only be programmed once, so we configure
+     * the device at each boot rather than trying to save to non-volatile memory */
+
     LOG_INF("GNSS configured for skydiving");
     
     return 0;
@@ -1436,11 +1682,11 @@ static void update_rtc_from_fix(void)
 {
     const struct device *rtc = DEVICE_DT_GET(DT_ALIAS(rtc0));
     struct rtc_time rtc_tm;
-    
+
     if (!device_is_ready(rtc)) {
         return;
     }
-    
+
     memset(&rtc_tm, 0, sizeof(rtc_tm));
     rtc_tm.tm_year = current_fix.year - 1900;
     rtc_tm.tm_mon = current_fix.month - 1;
@@ -1448,10 +1694,89 @@ static void update_rtc_from_fix(void)
     rtc_tm.tm_hour = current_fix.hours;
     rtc_tm.tm_min = current_fix.minutes;
     rtc_tm.tm_sec = current_fix.seconds;
-    
+
     int ret = rtc_set_time(rtc, &rtc_tm);
     if (ret == 0) {
         LOG_INF("RTC updated from GNSS");
     }
 }
 #endif
+
+/*
+ * UBX Communication Test Mode
+ *
+ * This test validates the UBX binary protocol communication with the SAM-M10Q:
+ * 1. Tests TX completion tracking (no EBUSY errors)
+ * 2. Tests UBX message framing and checksum
+ * 3. Tests ACK/NAK response parsing
+ */
+#ifdef CONFIG_GNSS_TEST_MODE
+
+int gnss_test_ubx_communication(void)
+{
+    int ret;
+    int tests_passed = 0;
+    int tests_failed = 0;
+
+    LOG_INF("=== GNSS UBX Communication Test ===");
+
+    /* Allow GNSS thread time to start processing */
+    k_msleep(100);
+
+    /*
+     * Test 1: Set dynamic model to Portable (0) - should succeed with ACK
+     */
+    LOG_INF("Test 1: Set dynamic model to Portable...");
+    ret = gnss_set_dynmodel(GNSS_DYNMODEL_PORTABLE);
+    if (ret == 0) {
+        LOG_INF("  PASS: Dynamic model set, ACK received");
+        tests_passed++;
+    } else if (ret == -ETIMEDOUT) {
+        LOG_ERR("  FAIL: ACK timeout (UBX parser may not be working)");
+        tests_failed++;
+    } else {
+        LOG_ERR("  FAIL: Error %d", ret);
+        tests_failed++;
+    }
+
+    k_msleep(100);
+
+    /*
+     * Test 2: Set rate to 1Hz - should succeed with ACK
+     */
+    LOG_INF("Test 2: Set update rate to 1Hz...");
+    ret = gnss_set_rate(1);
+    if (ret == 0) {
+        LOG_INF("  PASS: Rate set, ACK received");
+        tests_passed++;
+    } else if (ret == -ETIMEDOUT) {
+        LOG_ERR("  FAIL: ACK timeout");
+        tests_failed++;
+    } else {
+        LOG_ERR("  FAIL: Error %d", ret);
+        tests_failed++;
+    }
+
+    k_msleep(100);
+
+    /*
+     * Test 3: Set dynamic model to Airborne 2G - should succeed
+     */
+    LOG_INF("Test 3: Set dynamic model to Airborne 2G...");
+    ret = gnss_set_dynmodel(GNSS_DYNMODEL_AIRBORNE_2G);
+    if (ret == 0) {
+        LOG_INF("  PASS: Airborne 2G model set");
+        tests_passed++;
+    } else {
+        LOG_ERR("  FAIL: Error %d", ret);
+        tests_failed++;
+    }
+
+    /* Summary */
+    LOG_INF("=== Test Summary: %d passed, %d failed ===",
+            tests_passed, tests_failed);
+
+    return (tests_failed > 0) ? -1 : 0;
+}
+
+#endif /* CONFIG_GNSS_TEST_MODE */

@@ -1,0 +1,19 @@
+#
+# Tempo-BT Application Configuration
+#
+# SPDX-License-Identifier: Apache-2.0
+
+menu "Tempo-BT Application"
+
+config GNSS_TEST_MODE
+	bool "Enable GNSS UBX communication test at boot"
+	default n
+	help
+	  Run UBX protocol validation tests during GNSS initialization.
+	  This sends test commands to the SAM-M10Q and verifies ACK/NAK
+	  responses are received correctly. Useful for debugging
+	  communication issues with the GNSS module.
+
+endmenu
+
+source "Kconfig.zephyr"

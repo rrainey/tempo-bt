@@ -501,7 +501,17 @@ int main(void)
         /* GNSS failure is not critical - continue without it */
     } else {
         LOG_INF("GNSS initialized successfully");
-        
+
+#ifdef CONFIG_GNSS_TEST_MODE
+        /* Run UBX communication tests before configuring */
+        ret = gnss_test_ubx_communication();
+        if (ret < 0) {
+            LOG_ERR("GNSS UBX communication test FAILED");
+        } else {
+            LOG_INF("GNSS UBX communication test PASSED");
+        }
+#endif
+
         /* Configure GNSS for skydiving operations */
         ret = gnss_init_skydiving();
         if (ret < 0) {
