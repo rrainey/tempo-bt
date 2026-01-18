@@ -285,7 +285,7 @@ static void led_event_handler(const app_event_t *event, void *user_data)
         
     case EVT_STORAGE_ERROR:
     case EVT_SENSOR_ERROR:
-        /* Flash orange for errors */
+        /* Flash red for errors */
         set_color_led_state(RGB_RED, true);
         break;
         
@@ -664,6 +664,7 @@ int main(void)
         ret = event_bus_subscribe(&led_subscriber, 
                                  led_event_handler,
                                  (1U << EVT_MODE_CHANGE) | 
+                                 (1U << EVT_STATE_CHANGE) | 
                                  (1U << EVT_STORAGE_ERROR) |
                                  (1U << EVT_SENSOR_ERROR),
                                  NULL);

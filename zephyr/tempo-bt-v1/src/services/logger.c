@@ -354,11 +354,11 @@ int logger_arm(void)
 {
     k_mutex_lock(&logger_state.lock, K_FOREVER);
     
-    if (logger_state.state != LOGGER_STATE_IDLE) {
-        LOG_WRN("Cannot arm from state %s", state_to_string(logger_state.state));
-        k_mutex_unlock(&logger_state.lock);
-        return -EINVAL;
-    }
+    //if (logger_state.state != LOGGER_STATE_IDLE) {
+    //    LOG_WRN("Cannot arm from state %s", state_to_string(logger_state.state));
+    //    k_mutex_unlock(&logger_state.lock);
+    //    return -EINVAL;
+    //}
     
     /* If we haven't initialized ground altitude yet, do it now */
     baro_sample_t sample;
