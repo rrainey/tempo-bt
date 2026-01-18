@@ -21,36 +21,36 @@ A Zephyr RTOS-based flight data logging system for the nRF5340 platform, designe
 - **Runs on the [Tempo-BT V1 Board](../../hardware/tempo-bt)**
   - open source hardware design
   - part of this GitHub repository
+  - Design based on an FCC-certified u-blox NORA-B106 SOC
 
 - **High-frequency sensor logging**
   - 50 Hz IMU data (TDK InvenSense ICM-42688-V)
   - 4 Hz barometric pressure/temperature (Bosch BMP390)
   - 2-10 Hz GPS (u-blox SAM-M10Q)
-  - Optional magnetometer support (MMC5983MA)
+  - Optional magnetometer support (MMC5983MA) (not yet supported in firmware)
   
 - **Flexible storage options**
-  - Primary: SD card via SPI (exFAT support)
+  - Primary: SD card via SPI (includes exFAT support)
   - Fallback: Internal QSPI flash (littlefs)
   - Automatic storage detection at boot
   
 - **Wireless connectivity**
   - Bluetooth LE with mcumgr protocol
-  - File transfer over BLE (100-200 KB/s)
+  - File transfer over BLE (100-200 KB/s) (estimated)
   - Remote configuration and control
-  - OTA firmware updates
+  - OTA firmware updates (not yet tested)
   
-- **Intelligent flight detection**
-  - Automatic arming/disarming
+- **Intelligent logging**
+  - Automatic logging based on environmental conditions - the device starts logging when the jumppland leaves the ground and closes the log after landing
   - State machine with flight phase detection
-  - Configurable trigger thresholds
 
 ## Hardware Requirements
 
-- **Development Board**: nRF5340 DK or custom Tempo-BT V1 board
+- **Development Board**: nRF5340 DK or custom Tempo-BT V2 board
 - **Sensors** (connected as per hardware documentation):
   - ICM-42688-V IMU (SPI)
   - BMP390 Barometer (I²C)
-  - SAM-M10Q GNSS module (UART)
+  - SAM-M10Q GNSS module (115200 bps UART)
   - Optional: MMC5983MA Magnetometer (I²C)
 - **Storage**: SD card (recommended) or internal 8MB QSPI flash
 
@@ -69,7 +69,7 @@ A Zephyr RTOS-based flight data logging system for the nRF5340 platform, designe
 3. **Additional Tools**
    - Python 3.8 or higher
    - Git
-   - mcumgr CLI tool (for device interaction; mcumgr can be built from source)
+   - Python `smpmgr` tool  ([link](https://pypi.org/project/smpmgr/)) (see below)
 
 ### VS Code Configuration
 
@@ -89,8 +89,7 @@ Key configuration points:
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/rrainey/tempo
-cd tempo/zephyr/tempo-bt-v1
+git clone https://github.com/rrainey/tempo-bt
 ```
 
 ### 2. Open in VS Code
@@ -121,133 +120,11 @@ Using Command Line:
 ```bash
 west flash
 ```
+## Interacting with the device
 
-## Configuration
+The device is intended for use with the [tempo-insights](https://github.com/rrainey/tempo-insights) application.  That application is designed to run on a Raspberry Pi 5 (or later).  It leverages the Bluetooth hardware to communicate with a Tempo-BT device.
 
-### Project Configuration (prj.conf)
-
-Key configuration options:
-```conf
-# Storage backend
-CONFIG_SD_CARD_SUPPORT=y      # Enable SD card
-CONFIG_USE_INTERNAL_FLASH=n   # Use SD card as primary
-
-# Sensor rates
-CONFIG_IMU_SAMPLE_RATE_HZ=200
-CONFIG_BARO_SAMPLE_RATE_HZ=50
-CONFIG_GNSS_RATE_HZ=2
-
-# BLE settings
-CONFIG_BT_DEVICE_NAME="Tempo-BT"
-```
-
-### Runtime Configuration
-
-Many settings can be changed at runtime via mcumgr:
-- Logging thresholds
-- Sensor sample rates
-- Auto-arm parameters
-
-## Usage Examples
-
-### Connecting via Bluetooth
-
-We use [`mcumgr`](https://github.com/apache/mynewt-mcumgr) for testing the Bluetooth interfaces.  This software runs on Mac and Linux systems.  We can also use the nRF Connect mobile apps for some forms of tests.
-
-1. **Find the device**:
-```bash
-mcumgr --conntype ble --connstring ctlr_name=hci0 conn find
-```
-
-2. **Test connection**:
-```bash
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' echo hello
-```
-
-### File Operations
-
-1. **List logged sessions**:
-```bash
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' fs ls /logs
-```
-
-2. **Download a log file**:
-```bash
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' fs download /logs/20250117/12345678/flight.txt flight.txt
-```
-
-3. **Delete a log file**:
-```bash
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' fs delete /logs/20250117/12345678/flight.txt
-```
-
-Within this example path, `20250117` corresponds to the calendar date of the jump (`YYYMMDD`). `12345678` is a pseudo-random number assigned to each jump in that directory. The actual flight log will always be named `flight.txt`.
-
-### Device Control
-
-1. **Get device status**:
-```bash
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' stat list
-```
-
-2. **Get storage information**:
-```bash
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' custom storage_info -g 64
-```
-
-### Non-volatile Device Configuration Control
-
-The device maintains several persistent settings that can be queried and modified over Bluetooth using mcumgr's config commands.
-
-#### Available Settings
-
-| Setting | Description | Type | Default |
-|---------|-------------|------|---------|
-| `app/ble_name` | Bluetooth device name | String (max 31 chars) | "TempoBT" |
-| `app/user_uuid` | User identifier UUID | UUID (128-bit) | Auto-generated on first boot |
-| `app/device_uuid` | Device identifier UUID | UUID (128-bit) | Auto-generated on first boot |
-| `app/log_backend` | Storage backend type | String | "littlefs" |
-| `app/pps_enabled` | PPS time sync enabled | Boolean | false (V1 hardware) |
-
-#### Reading Settings
-
-To read a specific setting:
-```bash
-# Read device name
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' config app/ble_name
-
-# Read user UUID
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' config app/user_uuid
-
-# Read device UUID
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' config app/device_uuid
-
-# Read storage backend
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' config app/log_backend
-```
-
-#### Writing Settings
-
-To modify a setting:
-```bash
-# Change device name
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' config app/ble_name set "MyTempo"
-
-# Set storage backend (choose "littlefs" or "fatfs")
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' config app/log_backend set "fatfs"
-
-# Note: UUIDs are typically not changed after initial generation, but can be set if needed
-# Format: UUID must be provided as a 32-character hex string (no dashes)
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' config app/user_uuid set "550e8400e29b41d4a716446655440000"
-```
-
-#### Viewing All Settings
-
-To see all current settings at once:
-```bash
-# List all settings under the "app" namespace
-mcumgr --conntype ble --connstring peer_name='Tempo-BT' config app
-```
+That application repository includes extensions to the Python-based `smpmgr` command line tool ([link](https://pypi.org/project/smpmgr/)).  You can see examples of and experiment with interacting with a Tempo-BT device using that tool.
 
 #### Notes on UUIDs
 
@@ -262,14 +139,12 @@ mcumgr --conntype ble --connstring peer_name='Tempo-BT' config app
 
 All settings are stored in non-volatile memory and persist across power cycles and firmware updates.
 
-
 This revised section provides comprehensive documentation for all available settings, including examples of how to read and write each one using mcumgr commands.
 
 ### Manual Control
 
-The device can also be controlled via the onboard button:
-- **Short press**: Start/stop logging (when armed)
-- **Long press (3s)**: Arm/disarm the logger
+The device can also be controlled via the onboard BTN1 button (nearest the USB port):
+- **BTN1 Long press (2s)**: Manually start logging
 
 ## Data Format
 
@@ -304,7 +179,7 @@ The RGB LED provides visual system status:
 | Blue | Slow pulse | ARMED - Ready |
 | Green | Slow pulse | Logging - waiting for aircraft exit |
 | Orange | Slow pulse | Logging - in freefall or under canopy |
-| White | Solid | File transfer active |
+| White | Solid | File transfer active (not yet implemented) |
 | Red | Slow pulse | Fatal Error |
 
 Additionally, there is a separate Red LED which will blink when there is no usable GPS signal.
