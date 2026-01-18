@@ -92,8 +92,8 @@ static bool fifo_running = false;
 
 static imu_config_t current_config = {
     .odr_hz = 200,
-    .accel_range_g = 16,
-    .gyro_range_dps = 2000
+    .accel_range_g = 8,
+    .gyro_range_dps = 500
 };
 
 /* Sensitivity values based on current config */

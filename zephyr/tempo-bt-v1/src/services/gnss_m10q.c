@@ -135,8 +135,8 @@ static uint8_t uart_rx_buf2[GNSS_UART_BUFFER_SIZE];
 static uint8_t nmea_line_buf[GNSS_UART_BUFFER_SIZE];
 static size_t nmea_line_pos = 0;
 
-/* Ring buffer for UART RX - sized for ~2 seconds of data at 9600 baud */
-static uint8_t ring_buffer_mem[2048];
+/* Ring buffer for UART RX - sized for ~200ms of data at 115200 baud (~2300 bytes) */
+static uint8_t ring_buffer_mem[4096];
 static struct ring_buf rx_ring_buf;
 
 /* Semaphore to signal GNSS thread when data is available */
@@ -927,15 +927,85 @@ K_THREAD_DEFINE(gnss_thread_id, 4096, gnss_thread, NULL, NULL, NULL,
 
 /*
  * Early GNSS quiet function - call very early in boot sequence.
- * This disables NMEA output and drains any pending data to prevent
- * buffer overruns when the GNSS module continues running after CPU reset.
+ * This establishes 115200 baud communication with the SAM-M10Q and disables
+ * NMEA output to prevent buffer overruns when the GNSS module continues
+ * running after CPU reset.
+ *
+ * Strategy:
+ * 1. Try 115200 baud first - sniff for valid bytes for up to 500ms
+ * 2. If no valid data at 115200, switch to 9600 and send baud rate change command
+ * 3. Switch host to 115200, wait 100ms, drain buffer
+ * 4. Send NMEA disable commands at 115200 baud
  */
+
+/*
+ * Helper to calculate UBX checksum for early quiet (before ubx_checksum is defined)
+ */
+static void ubx_calc_checksum(const uint8_t *data, size_t len, uint8_t *ck_a, uint8_t *ck_b)
+{
+    *ck_a = 0;
+    *ck_b = 0;
+    for (size_t i = 0; i < len; i++) {
+        *ck_a += data[i];
+        *ck_b += *ck_a;
+    }
+}
+
+/*
+ * Build and send UBX-CFG-VALSET to set UART1 baud rate
+ * Key: CFG-UART1-BAUDRATE (0x40520001)
+ */
+static void send_ubx_baudrate_config(const struct device *dev, uint32_t baudrate)
+{
+    uint8_t msg[20];
+    uint8_t ck_a, ck_b;
+
+    /* UBX header */
+    msg[0] = 0xB5;  /* Sync 1 */
+    msg[1] = 0x62;  /* Sync 2 */
+    msg[2] = 0x06;  /* Class: CFG */
+    msg[3] = 0x8A;  /* ID: VALSET */
+    msg[4] = 0x0C;  /* Length LSB (12 bytes payload) */
+    msg[5] = 0x00;  /* Length MSB */
+
+    /* Payload */
+    msg[6] = 0x00;  /* Version */
+    msg[7] = 0x01;  /* Layers: RAM only */
+    msg[8] = 0x00;  /* Reserved */
+    msg[9] = 0x00;  /* Reserved */
+
+    /* Key ID: CFG-UART1-BAUDRATE (0x40520001) little-endian */
+    msg[10] = 0x01;
+    msg[11] = 0x00;
+    msg[12] = 0x52;
+    msg[13] = 0x40;
+
+    /* Value: baudrate in little-endian */
+    msg[14] = (baudrate >> 0) & 0xFF;
+    msg[15] = (baudrate >> 8) & 0xFF;
+    msg[16] = (baudrate >> 16) & 0xFF;
+    msg[17] = (baudrate >> 24) & 0xFF;
+
+    /* Calculate checksum over class, id, length, and payload (bytes 2-17) */
+    ubx_calc_checksum(&msg[2], 16, &ck_a, &ck_b);
+    msg[18] = ck_a;
+    msg[19] = ck_b;
+
+    /* Send message using polling */
+    for (size_t i = 0; i < sizeof(msg); i++) {
+        uart_poll_out(dev, msg[i]);
+    }
+}
+
 int gnss_early_quiet(void)
 {
     const struct device *dev;
     int ret;
+    uint8_t byte;
+    int valid_bytes = 0;
+    bool already_at_115200 = false;
 
-    LOG_INF("GNSS early quiet: silencing module");
+    LOG_INF("GNSS early quiet: establishing 115200 baud communication");
 
     /* Get UART device */
     dev = DEVICE_DT_GET(GNSS_UART_NODE);
@@ -944,33 +1014,110 @@ int gnss_early_quiet(void)
         return -ENODEV;
     }
 
-    /* Configure UART for polling mode (no async callbacks yet) */
+    /* UART configuration template */
     struct uart_config cfg = {
-        .baudrate = 9600,
+        .baudrate = 115200,
         .parity = UART_CFG_PARITY_NONE,
         .stop_bits = UART_CFG_STOP_BITS_1,
         .data_bits = UART_CFG_DATA_BITS_8,
         .flow_ctrl = UART_CFG_FLOW_CTRL_NONE
     };
 
+    /*
+     * Step 1: Try 115200 baud first - sniff for valid bytes
+     * If the module is already at 115200, we'll see valid NMEA data
+     */
     ret = uart_configure(dev, &cfg);
     if (ret < 0) {
-        LOG_WRN("Failed to configure UART for early quiet: %d", ret);
-        /* Continue anyway - might work with existing config */
+        LOG_WRN("Failed to configure UART at 115200: %d", ret);
     }
 
-    /* Drain any pending RX data (polling mode) */
-    uint8_t dummy;
-    int drained = 0;
-    while (uart_poll_in(dev, &dummy) == 0 && drained < 2048) {
-        drained++;
+    /* Sniff for up to 500ms or until we see 10-20 valid non-zero bytes */
+    int64_t start_time = k_uptime_get();
+    while ((k_uptime_get() - start_time) < 500 && valid_bytes < 15) {
+        if (uart_poll_in(dev, &byte) == 0) {
+            /* Any non-zero byte is considered valid */
+            if (byte != 0) {
+                valid_bytes++;
+            }
+        }
+        k_busy_wait(100);  /* Small delay to avoid busy-spinning too hard */
     }
-    if (drained > 0) {
-        LOG_INF("GNSS early quiet: drained %d bytes", drained);
+
+    if (valid_bytes >= 10) {
+        /* Got valid data at 115200 - module is already configured */
+        LOG_INF("GNSS already at 115200 baud (%d valid bytes received)", valid_bytes);
+        already_at_115200 = true;
+    } else {
+        /*
+         * Step 2: No valid data at 115200 - switch to 9600 and reconfigure module
+         */
+        LOG_INF("No valid data at 115200 (%d bytes), switching to 9600 to reconfigure",
+                valid_bytes);
+
+        cfg.baudrate = 9600;
+        ret = uart_configure(dev, &cfg);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure UART at 9600: %d", ret);
+            return ret;
+        }
+
+        /* Drain any garbage from the failed 115200 attempt */
+        int drained = 0;
+        while (uart_poll_in(dev, &byte) == 0 && drained < 512) {
+            drained++;
+        }
+
+        /* Small delay to let UART settle */
+        k_msleep(10);
+
+        /*
+         * Send UBX-CFG-VALSET to change SAM-M10Q UART1 to 115200 baud
+         * Per u-blox documentation, the ACK will be sent at the NEW baud rate,
+         * so we don't try to receive it. Instead, we immediately switch the
+         * host UART and wait for the module to complete the change.
+         */
+        LOG_INF("Sending baud rate change command to SAM-M10Q");
+        send_ubx_baudrate_config(dev, 115200);
+
+        /* Wait for TX to complete (at 9600 baud, 20 bytes takes ~21ms) */
+        k_msleep(25);
+
+        /*
+         * Step 3: Switch host UART to 115200 immediately
+         * The SAM-M10Q will switch after processing the command
+         */
+        cfg.baudrate = 115200;
+        ret = uart_configure(dev, &cfg);
+        if (ret < 0) {
+            LOG_ERR("Failed to switch UART to 115200: %d", ret);
+            return ret;
+        }
+
+        /* Wait at least 100ms for module to complete baud rate change */
+        k_msleep(100);
+
+        /* Drain any response/garbage from the transition */
+        drained = 0;
+        while (uart_poll_in(dev, &byte) == 0 && drained < 1024) {
+            drained++;
+        }
+        LOG_INF("GNSS baud rate changed to 115200, drained %d bytes", drained);
     }
 
     /*
-     * Send UBX-CFG-MSG commands to disable all standard NMEA messages.
+     * Step 4: Now at 115200 baud - drain any pending NMEA data
+     */
+    int drained = 0;
+    while (uart_poll_in(dev, &byte) == 0 && drained < 4096) {
+        drained++;
+    }
+    if (drained > 0) {
+        LOG_INF("GNSS early quiet: drained %d bytes at 115200", drained);
+    }
+
+    /*
+     * Step 5: Send UBX-CFG-MSG commands to disable all standard NMEA messages
      * This uses polling mode TX since async isn't set up yet.
      * Format: UBX-CFG-MSG with rate=0 for UART1
      */
@@ -982,7 +1129,7 @@ int gnss_early_quiet(void)
         0x08, 0x00,             /* Length = 8 */
         0xF0, 0x00,             /* NMEA-GGA message */
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* Rates for 6 ports (all 0) */
-        0xFF, 0x23              /* Checksum (placeholder) */
+        0xFF, 0x23              /* Checksum */
     };
 
     /* UBX-CFG-MSG to disable GLL (0xF0 0x01) */
@@ -1020,7 +1167,7 @@ int gnss_early_quiet(void)
         0x04, 0x46
     };
 
-    /* Send disable commands using poll_out */
+    /* Send disable commands using poll_out at 115200 */
     const uint8_t *cmds[] = {
         disable_gga, disable_gll, disable_gsa,
         disable_gsv, disable_rmc, disable_vtg
@@ -1032,22 +1179,22 @@ int gnss_early_quiet(void)
             uart_poll_out(dev, cmds[i][j]);
         }
         /* Small delay between commands */
-        k_busy_wait(1000);  /* 1ms */
+        k_busy_wait(500);  /* 0.5ms - faster at 115200 */
     }
 
-    /* Wait a bit for commands to be processed */
+    /* Wait for commands to be processed */
     k_msleep(50);
 
-    /* Drain any response/remaining data */
+    /* Final drain of any response/remaining data */
     drained = 0;
-    while (uart_poll_in(dev, &dummy) == 0 && drained < 1024) {
+    while (uart_poll_in(dev, &byte) == 0 && drained < 1024) {
         drained++;
     }
     if (drained > 0) {
         LOG_INF("GNSS early quiet: drained %d more bytes after quiet commands", drained);
     }
 
-    LOG_INF("GNSS early quiet: complete");
+    LOG_INF("GNSS early quiet: complete at 115200 baud");
     return 0;
 }
 
@@ -1076,9 +1223,9 @@ int gnss_init(void)
         LOG_WRN("Failed to get current UART config: %d", ret);
     }   
     
-    /* Configure UART */
+    /* Configure UART - 115200 baud established by gnss_early_quiet() */
     struct uart_config cfg = {
-        .baudrate = 9600,  /* SAM-M10Q default is actually 9600 */
+        .baudrate = 115200,
         .parity = UART_CFG_PARITY_NONE,
         .stop_bits = UART_CFG_STOP_BITS_1,
         .data_bits = UART_CFG_DATA_BITS_8,
