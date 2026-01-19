@@ -31,8 +31,7 @@ static struct k_mutex subscriber_mutex;
 static const char *event_names[] = {
     [EVT_SESSION_START] = "SESSION_START",
     [EVT_SESSION_STOP] = "SESSION_STOP",
-    [EVT_MODE_CHANGE] = "MODE_CHANGE",
-    [EVT_PHASE_CHANGE] = "PHASE_CHANGE",
+    [EVT_STATE_CHANGE] = "STATE_CHANGE",
     [EVT_STORAGE_LOW] = "STORAGE_LOW",
     [EVT_STORAGE_ERROR] = "STORAGE_ERROR",
     [EVT_UPLOAD_START] = "UPLOAD_START",

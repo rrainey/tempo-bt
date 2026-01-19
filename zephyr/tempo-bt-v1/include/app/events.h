@@ -16,9 +16,7 @@ typedef enum {
     EVT_SESSION_START,
     EVT_SESSION_STOP,
     
-    /* State change events */
-    EVT_MODE_CHANGE,
-    EVT_PHASE_CHANGE,
+    /* Logging state machine change */
     EVT_STATE_CHANGE,
     
     /* Storage events */

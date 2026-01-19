@@ -278,7 +278,7 @@ static void led_event_handler(const app_event_t *event, void *user_data)
     ARG_UNUSED(user_data);
     
     switch (event->type) {
-    case EVT_MODE_CHANGE:
+    case EVT_STATE_CHANGE:
         /* Update LED based on logger state */
         update_led_for_state(logger_get_state());
         break;
@@ -663,7 +663,6 @@ int main(void)
         /* Subscribe to events for LED updates */
         ret = event_bus_subscribe(&led_subscriber, 
                                  led_event_handler,
-                                 (1U << EVT_MODE_CHANGE) | 
                                  (1U << EVT_STATE_CHANGE) | 
                                  (1U << EVT_STORAGE_ERROR) |
                                  (1U << EVT_SENSOR_ERROR),
