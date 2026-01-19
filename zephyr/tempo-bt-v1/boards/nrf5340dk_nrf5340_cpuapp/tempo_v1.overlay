@@ -193,7 +193,7 @@
         compatible = "invensense,icm42688";
         status = "okay";
         reg = <0>;
-        spi-max-frequency = <1000000>;
+        spi-max-frequency = <16000000>;
         int-gpios = <&gpio1 7 GPIO_ACTIVE_HIGH>;
         accel-pwr-mode = <ICM42688_DT_ACCEL_LN>;
         accel-fs = <ICM42688_DT_ACCEL_FS_16>;
@@ -216,15 +216,17 @@
         compatible = "bosch,bmp390";
         reg = <0x76>;
         label = "BMP390";
+        int-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
     };
     
     /* 
     mmc5983ma: mmc5983ma@30 {
         compatible = "memsic,mmc5983ma";
         reg = <0x30>;
-        label = "MMC5983MA";
+        int-gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;
     };
     */
+
 };
 
 /* APP_NORA UART */

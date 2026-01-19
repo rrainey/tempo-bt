@@ -14,6 +14,23 @@ config GNSS_TEST_MODE
 	  responses are received correctly. Useful for debugging
 	  communication issues with the GNSS module.
 
+config USE_MAG_IN_ORIENTATION
+	bool "Use magnetometer in orientation AHRS"
+	default n
+	depends on MMC5983MA
+	help
+	  When enabled, the orientation service will read magnetometer
+	  samples from the MMC5983MA sensor and feed them to the Fusion
+	  AHRS algorithm for improved heading accuracy. This provides
+	  absolute heading reference but requires magnetometer calibration.
+
+	  When disabled, the AHRS operates in IMU-only mode using
+	  gyroscope and accelerometer data. Heading will drift over time
+	  but is immune to magnetic interference.
+
 endmenu
+
+# Include project-specific drivers
+rsource "drivers/Kconfig"
 
 source "Kconfig.zephyr"

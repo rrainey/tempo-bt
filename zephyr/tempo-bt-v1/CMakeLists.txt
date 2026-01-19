@@ -5,8 +5,12 @@
 #
 cmake_minimum_required(VERSION 3.20.0)
 
+# Add custom devicetree bindings
+list(APPEND DTS_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(tempo-bt-v1)
+
 
 # Generate version header
 set(VERSION_HEADER ${CMAKE_CURRENT_BINARY_DIR}/include/generated/app_version.h)
@@ -52,6 +56,16 @@ target_sources(app PRIVATE
     src/services/logger.c
     src/services/file_writer.c
     src/services/led.c
+)
+
+# Magnetometer driver and service (optional)
+target_sources_ifdef(CONFIG_MMC5983MA app PRIVATE
+    drivers/sensor/mmc5983ma/mmc5983ma.c
+    drivers/sensor/mmc5983ma/mmc5983ma_i2c.c
+    src/services/mag_mmc5983ma.c
+)
+target_include_directories_ifdef(CONFIG_MMC5983MA app PRIVATE
+    drivers/sensor/mmc5983ma
 )
 
 # Utility sources

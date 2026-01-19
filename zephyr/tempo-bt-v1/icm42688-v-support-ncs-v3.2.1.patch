@@ -1,0 +1,271 @@
+ICM42688-V Support Patch for nRF Connect SDK v3.2.1 (Zephyr)
+=============================================================
+
+This patch adds support for the ICM42688-V variant (WHO_AM_I = 0xDB)
+and changes the reset sequence to poll for RESET_DONE instead of using
+a fixed delay. This is necessary because the RESET_DONE bit in INT_STATUS
+is read-to-clear, and if anything reads it before the driver checks, the
+driver would fail.
+
+Apply to: c:/ncs/v3.2.1/zephyr/drivers/sensor/tdk/icm4268x/
+
+Note: The driver was renamed from icm42688 to icm4268x in this version
+to support multiple chip variants (ICM42688 and ICM42686).
+
+================================================================================
+PATCH 1: icm4268x_reg.h
+================================================================================
+
+--- a/drivers/sensor/tdk/icm4268x/icm4268x_reg.h
++++ b/drivers/sensor/tdk/icm4268x/icm4268x_reg.h
+@@ -502,6 +502,7 @@ #define MASK_CLKDIV GENMASK(6, 0)
+
+ /* misc. defines */
+ #define WHO_AM_I_ICM42688     0x47
++#define WHO_AM_I_ICM42688V    0xDB  /* ICM42688-V variant */
+ #define WHO_AM_I_ICM42686     0x44
+ #define MIN_ACCEL_SENS_SHIFT  11
+ #define ACCEL_DATA_SIZE	      6
+@@ -509,7 +510,10 @@ #define GYRO_DATA_SIZE	      6
+ #define TEMP_DATA_SIZE	      2
+ #define MCLK_POLL_INTERVAL_US 250
+ #define MCLK_POLL_ATTEMPTS    100
+-#define SOFT_RESET_TIME_MS    2 /* 1ms + elbow room */
++#define SOFT_RESET_TIME_MS    10 /* ICM42688-V needs more time after soft reset */
++/* Maximum time to wait for RESET_DONE in milliseconds */
++#define RESET_DONE_TIMEOUT_MS 100
++#define RESET_DONE_POLL_MS    1
+
+ /* FIFO header */
+ #define FIFO_HEADER_ACCEL	    BIT(6)
+
+================================================================================
+PATCH 2: icm4268x_common.c
+================================================================================
+
+--- a/drivers/sensor/tdk/icm4268x/icm4268x_common.c
++++ b/drivers/sensor/tdk/icm4268x/icm4268x_common.c
+@@ -21,6 +21,8 @@ int icm4268x_reset(const struct device *dev)
+ {
+ 	int res;
+ 	uint8_t value;
+ 	const struct icm4268x_dev_cfg *dev_cfg = dev->config;
+ 	struct icm4268x_dev_data *dev_data = dev->data;
+-	uint8_t expected_who_am_i;
++	int elapsed_ms = 0;
++	bool reset_done = false;
+
+ 	/* start up time for register read/write after POR is 1ms and supply ramp time is 3ms */
+ 	k_msleep(3);
+@@ -37,18 +39,33 @@ int icm4268x_reset(const struct device *dev)
+ 		return res;
+ 	}
+
+-	/* wait for soft reset to take effect */
+-	k_msleep(SOFT_RESET_TIME_MS);
+-
+-	/* clear reset done int flag */
+-	res = icm4268x_spi_read(&dev_cfg->spi, REG_INT_STATUS, &value, 1);
+-
+-	if (res) {
+-		return res;
++	/* Poll for RESET_DONE bit instead of fixed delay.
++	 * The ICM42688-V variant may have different timing characteristics.
++	 * The RESET_DONE bit in INT_STATUS is set when reset completes and
++	 * is cleared on read (read-to-clear).
++	 */
++	while (elapsed_ms < RESET_DONE_TIMEOUT_MS) {
++		k_msleep(RESET_DONE_POLL_MS);
++		elapsed_ms += RESET_DONE_POLL_MS;
++
++		res = icm4268x_spi_read(&dev_cfg->spi, REG_INT_STATUS, &value, 1);
++		if (res) {
++			LOG_DBG("Failed to read INT_STATUS: %d", res);
++			continue;
++		}
++
++		LOG_DBG("INT_STATUS @%dms: 0x%02X", elapsed_ms, value);
++
++		if (FIELD_GET(BIT_RESET_DONE_INT, value) == 1) {
++			reset_done = true;
++			LOG_DBG("RESET_DONE detected at %dms", elapsed_ms);
++			break;
++		}
+ 	}
+
+-	if (FIELD_GET(BIT_RESET_DONE_INT, value) != 1) {
+-		LOG_ERR("unexpected RESET_DONE value, %i", value);
+-		return -EINVAL;
++	if (!reset_done) {
++		LOG_WRN("RESET_DONE not detected after %dms (INT_STATUS=0x%02X), continuing",
++			elapsed_ms, value);
++		/* Don't fail - verify the chip is working by reading WHO_AM_I */
+ 	}
+
+ 	res = icm4268x_spi_read(&dev_cfg->spi, REG_WHO_AM_I, &value, 1);
+@@ -56,19 +73,15 @@ int icm4268x_reset(const struct device *dev)
+ 		return res;
+ 	}
+
+-	switch (dev_data->cfg.variant) {
+-	case ICM4268X_VARIANT_ICM42688:
+-		expected_who_am_i = WHO_AM_I_ICM42688;
+-		break;
+-	case ICM4268X_VARIANT_ICM42686:
+-		expected_who_am_i = WHO_AM_I_ICM42686;
+-		break;
+-	default:
+-		LOG_ERR("Invalid variant: %d", dev_data->cfg.variant);
+-		return -EINVAL;
+-	}
++	LOG_INF("WHO_AM_I: 0x%02X", value);
+
+-	if (value != expected_who_am_i) {
+-		LOG_ERR("invalid WHO_AM_I value, was %i but expected %i", value, expected_who_am_i);
++	/* Accept WHO_AM_I for the configured variant.
++	 * ICM42688 variant accepts both 0x47 (standard) and 0xDB (ICM42688-V)
++	 */
++	if ((dev_data->cfg.variant == ICM4268X_VARIANT_ICM42688 &&
++	     value != WHO_AM_I_ICM42688 && value != WHO_AM_I_ICM42688V) ||
++	    (dev_data->cfg.variant == ICM4268X_VARIANT_ICM42686 &&
++	     value != WHO_AM_I_ICM42686)) {
++		LOG_ERR("invalid WHO_AM_I value 0x%02X for variant %d", value, dev_data->cfg.variant);
+ 		return -EINVAL;
+ 	}
+
+================================================================================
+MANUAL APPLICATION INSTRUCTIONS
+================================================================================
+
+Since this is a unified diff format, you can apply it with:
+
+    cd c:/ncs/v3.2.1/zephyr
+    git apply /path/to/icm42688-v-support-ncs-v3.2.1.patch
+
+Or apply manually by editing the two files as described below:
+
+--- FILE 1: icm4268x_reg.h ---
+
+1. Find the "misc. defines" section (around line 504-513)
+
+2. Add the ICM42688-V WHO_AM_I after ICM42688:
+
+   BEFORE:
+   #define WHO_AM_I_ICM42688     0x47
+   #define WHO_AM_I_ICM42686     0x44
+
+   AFTER:
+   #define WHO_AM_I_ICM42688     0x47
+   #define WHO_AM_I_ICM42688V    0xDB  /* ICM42688-V variant */
+   #define WHO_AM_I_ICM42686     0x44
+
+3. Update SOFT_RESET_TIME_MS and add polling constants:
+
+   BEFORE:
+   #define SOFT_RESET_TIME_MS    2 /* 1ms + elbow room */
+
+   AFTER:
+   #define SOFT_RESET_TIME_MS    10 /* ICM42688-V needs more time after soft reset */
+   /* Maximum time to wait for RESET_DONE in milliseconds */
+   #define RESET_DONE_TIMEOUT_MS 100
+   #define RESET_DONE_POLL_MS    1
+
+--- FILE 2: icm4268x_common.c ---
+
+1. In icm4268x_reset() function, replace variable declarations (lines 23-27):
+
+   BEFORE:
+   	const struct icm4268x_dev_cfg *dev_cfg = dev->config;
+   	struct icm4268x_dev_data *dev_data = dev->data;
+   	uint8_t expected_who_am_i;
+
+   AFTER:
+   	const struct icm4268x_dev_cfg *dev_cfg = dev->config;
+   	struct icm4268x_dev_data *dev_data = dev->data;
+   	int elapsed_ms = 0;
+   	bool reset_done = false;
+
+2. Replace the reset wait and check section (lines 40-53) with polling:
+
+   BEFORE:
+   	/* wait for soft reset to take effect */
+   	k_msleep(SOFT_RESET_TIME_MS);
+
+   	/* clear reset done int flag */
+   	res = icm4268x_spi_read(&dev_cfg->spi, REG_INT_STATUS, &value, 1);
+
+   	if (res) {
+   		return res;
+   	}
+
+   	if (FIELD_GET(BIT_RESET_DONE_INT, value) != 1) {
+   		LOG_ERR("unexpected RESET_DONE value, %i", value);
+   		return -EINVAL;
+   	}
+
+   AFTER:
+   	/* Poll for RESET_DONE bit instead of fixed delay.
+   	 * The ICM42688-V variant may have different timing characteristics.
+   	 * The RESET_DONE bit in INT_STATUS is set when reset completes and
+   	 * is cleared on read (read-to-clear).
+   	 */
+   	while (elapsed_ms < RESET_DONE_TIMEOUT_MS) {
+   		k_msleep(RESET_DONE_POLL_MS);
+   		elapsed_ms += RESET_DONE_POLL_MS;
+
+   		res = icm4268x_spi_read(&dev_cfg->spi, REG_INT_STATUS, &value, 1);
+   		if (res) {
+   			LOG_DBG("Failed to read INT_STATUS: %d", res);
+   			continue;
+   		}
+
+   		LOG_DBG("INT_STATUS @%dms: 0x%02X", elapsed_ms, value);
+
+   		if (FIELD_GET(BIT_RESET_DONE_INT, value) == 1) {
+   			reset_done = true;
+   			LOG_DBG("RESET_DONE detected at %dms", elapsed_ms);
+   			break;
+   		}
+   	}
+
+   	if (!reset_done) {
+   		LOG_WRN("RESET_DONE not detected after %dms (INT_STATUS=0x%02X), continuing",
+   			elapsed_ms, value);
+   		/* Don't fail - verify the chip is working by reading WHO_AM_I */
+   	}
+
+3. Replace the WHO_AM_I check section (lines 60-75):
+
+   BEFORE:
+   	switch (dev_data->cfg.variant) {
+   	case ICM4268X_VARIANT_ICM42688:
+   		expected_who_am_i = WHO_AM_I_ICM42688;
+   		break;
+   	case ICM4268X_VARIANT_ICM42686:
+   		expected_who_am_i = WHO_AM_I_ICM42686;
+   		break;
+   	default:
+   		LOG_ERR("Invalid variant: %d", dev_data->cfg.variant);
+   		return -EINVAL;
+   	}
+
+   	if (value != expected_who_am_i) {
+   		LOG_ERR("invalid WHO_AM_I value, was %i but expected %i", value, expected_who_am_i);
+   		return -EINVAL;
+   	}
+
+   AFTER:
+   	LOG_INF("WHO_AM_I: 0x%02X", value);
+
+   	/* Accept WHO_AM_I for the configured variant.
+   	 * ICM42688 variant accepts both 0x47 (standard) and 0xDB (ICM42688-V)
+   	 */
+   	if ((dev_data->cfg.variant == ICM4268X_VARIANT_ICM42688 &&
+   	     value != WHO_AM_I_ICM42688 && value != WHO_AM_I_ICM42688V) ||
+   	    (dev_data->cfg.variant == ICM4268X_VARIANT_ICM42686 &&
+   	     value != WHO_AM_I_ICM42686)) {
+   		LOG_ERR("invalid WHO_AM_I value 0x%02X for variant %d", value, dev_data->cfg.variant);
+   		return -EINVAL;
+   	}
+
+================================================================================

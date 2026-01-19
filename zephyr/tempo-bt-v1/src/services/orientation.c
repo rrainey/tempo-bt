@@ -15,6 +15,10 @@
 #include "services/imu.h"
 #include "fusion.h"
 
+#if CONFIG_USE_MAG_IN_ORIENTATION
+#include "services/mag.h"
+#endif
+
 LOG_MODULE_REGISTER(orientation, LOG_LEVEL_INF);
 
 /* Polling configuration */
@@ -95,7 +99,24 @@ static void process_sample(const imu_sample_t *sample)
     };
 
     /* Update AHRS algorithm */
+#if CONFIG_USE_MAG_IN_ORIENTATION
+    if (state.config.use_magnetometer && mag_is_ready()) {
+        FusionVector magnetometer;
+        if (mag_read_fusion(&magnetometer) == 0) {
+            FusionAhrsUpdate(&state.ahrs, gyroscope, accelerometer,
+                             magnetometer, delta_time);
+        } else {
+            /* Magnetometer read failed, fall back to IMU-only */
+            FusionAhrsUpdateNoMagnetometer(&state.ahrs, gyroscope,
+                                           accelerometer, delta_time);
+        }
+    } else {
+        FusionAhrsUpdateNoMagnetometer(&state.ahrs, gyroscope,
+                                       accelerometer, delta_time);
+    }
+#else
     FusionAhrsUpdateNoMagnetometer(&state.ahrs, gyroscope, accelerometer, delta_time);
+#endif
 
     state.sample_count++;
 }

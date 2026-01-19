@@ -1,0 +1,43 @@
+# Copyright (c) 2024
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig MMC5983MA
+	bool "MEMSIC MMC5983MA 3-axis magnetometer"
+	default y
+	depends on DT_HAS_MEMSIC_MMC5983MA_ENABLED
+	select I2C
+	help
+	  Enable driver for the MEMSIC MMC5983MA 3-axis magnetometer
+	  and temperature sensor.
+
+	  Features:
+	  - ±8 Gauss full scale range
+	  - 18-bit resolution
+	  - Built-in SET/RESET for offset compensation
+	  - I2C interface
+
+if MMC5983MA
+
+config MMC5983MA_TRIGGER
+	bool "Enable trigger (interrupt) support"
+	depends on GPIO
+	help
+	  Enable interrupt-driven data ready notification.
+	  Requires the int-gpios property to be set in devicetree.
+
+config MMC5983MA_CALIBRATION
+	bool "Enable runtime calibration support"
+	default y
+	help
+	  Enable runtime hard-iron and soft-iron calibration.
+	  Calibration data can be stored/loaded via Zephyr settings subsystem.
+
+config MMC5983MA_CALIBRATION_SAMPLES
+	int "Number of samples for calibration"
+	default 500
+	depends on MMC5983MA_CALIBRATION
+	help
+	  Number of samples to collect during calibration routine.
+	  More samples improve accuracy but take longer.
+
+endif # MMC5983MA

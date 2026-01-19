@@ -1,0 +1,109 @@
+# Copyright (c) 2024
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  MEMSIC MMC5983MA 3-axis magnetometer with temperature sensor.
+
+  Features:
+  - ±8 Gauss full scale range
+  - 18-bit resolution (0.0625 mG/LSB)
+  - Up to 1000 Hz output data rate
+  - Built-in SET/RESET for offset elimination
+  - I2C interface (400 kHz fast mode)
+
+  Example devicetree node:
+
+    &i2c1 {
+        mmc5983ma: mmc5983ma@30 {
+            compatible = "memsic,mmc5983ma";
+            reg = <0x30>;
+            status = "okay";
+
+            /* Optional configuration */
+            bandwidth = <0>;        /* 0=100Hz, 1=200Hz, 2=400Hz, 3=800Hz */
+            auto-sr;                /* Enable automatic SET/RESET */
+        };
+    };
+
+compatible: "memsic,mmc5983ma"
+
+include: [sensor-device.yaml, i2c-device.yaml]
+
+properties:
+  bandwidth:
+    type: int
+    default: 0
+    description: |
+      Bandwidth selection (decimation filter length).
+      Controls measurement time and noise level.
+        0: 8ms measurement, 100Hz bandwidth, 0.4mG RMS noise
+        1: 4ms measurement, 200Hz bandwidth, 0.6mG RMS noise
+        2: 2ms measurement, 400Hz bandwidth, 0.8mG RMS noise
+        3: 0.5ms measurement, 800Hz bandwidth, 1.2mG RMS noise
+    enum:
+      - 0
+      - 1
+      - 2
+      - 3
+
+  auto-sr:
+    type: boolean
+    description: |
+      Enable automatic SET/RESET function.
+      When enabled, the sensor automatically performs SET/RESET
+      operations to eliminate bridge offset drift with temperature.
+      Recommended for best accuracy.
+
+  continuous-mode-rate:
+    type: int
+    default: 0
+    description: |
+      Continuous measurement mode frequency in Hz.
+      Set to 0 to disable continuous mode (use single-shot).
+      Valid values: 0 (off), 1, 10, 20, 50, 100, 200, 1000
+    enum:
+      - 0
+      - 1
+      - 10
+      - 20
+      - 50
+      - 100
+      - 200
+      - 1000
+
+  int-gpios:
+    type: phandle-array
+    description: |
+      Optional interrupt GPIO for data-ready notification.
+      The INT pin is active high when a measurement completes.
+
+  # Calibration defaults (can be overridden at runtime via settings)
+  cal-offset-x:
+    type: int
+    default: 0
+    description: Hard-iron X offset in raw 18-bit counts
+
+  cal-offset-y:
+    type: int
+    default: 0
+    description: Hard-iron Y offset in raw 18-bit counts
+
+  cal-offset-z:
+    type: int
+    default: 0
+    description: Hard-iron Z offset in raw 18-bit counts
+
+  cal-scale-x:
+    type: int
+    default: 32768
+    description: X axis scale factor (Q1.15 fixed-point, 32768 = 1.0)
+
+  cal-scale-y:
+    type: int
+    default: 32768
+    description: Y axis scale factor (Q1.15 fixed-point, 32768 = 1.0)
+
+  cal-scale-z:
+    type: int
+    default: 32768
+    description: Z axis scale factor (Q1.15 fixed-point, 32768 = 1.0)
