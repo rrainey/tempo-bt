@@ -503,16 +503,6 @@ int imu_fifo_read(imu_sample_t *samples, size_t max_count)
         valid_count++;
     }
 
-    /* Debug logging for first few reads */
-    static int debug_count = 0;
-    if (debug_count < 5 && valid_count > 0) {
-        LOG_INF("FIFO read: %d packets, accel=[%.2f,%.2f,%.2f] gyro=[%.4f,%.4f,%.4f]",
-                (int)valid_count,
-                (double)samples[0].accel_x, (double)samples[0].accel_y, (double)samples[0].accel_z,
-                (double)samples[0].gyro_x, (double)samples[0].gyro_y, (double)samples[0].gyro_z);
-        debug_count++;
-    }
-
     return (int)valid_count;
 }
 
