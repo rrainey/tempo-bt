@@ -3,7 +3,7 @@
 A Dropkick log is an extended NMEA-sentence text file. It is composed of [NMEA 0183](https://en.wikipedia.org/wiki/NMEA_0183) standard GPS records, or "sentences" using NMEA terminology,
  interspersed with the application-specific sentences described below.
 
- While the dropkick box is turned on, a new log file will be created when the device detects that aircraft carrying the skydiver has taken off.  Logging continues 
+ While the Tempo-BT box is turned on, a new log file will be created when the device detects that aircraft carrying the skydiver has taken off.  Logging continues 
  until a short time after the jumper reaches the ground.
 
  ## Time bases
@@ -66,7 +66,7 @@ Dropkick board Body Axes
 ![Tempo Frames](images/tempo-v1-frames.png)
 Template board Axes, including the Case (or Body) Axis definitions
 
-## $PIM2 Record (Tempo boards only)
+## $PIM2 Record (Tempo/Tempo-BT devices only)
 
 This is the real-time orientation of the jumper expressed as a [Quaternion](https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation).
 
@@ -98,7 +98,7 @@ as future work in this project.
 ## $PENV Record
 
 This record logs pressure information captured from the 
-[DPS310 sensor IC](https://www.infineon.com/dgdl/Infineon-DPS310-DataSheet-v01_02-EN.pdf?fileId=5546d462576f34750157750826c42242) and a resistor ladder used to monitor the VBATT battery line voltage level.
+[BMP390 sensor IC](https://www.infineon.com/dgdl/Infineon-DPS310-DataSheet-v01_02-EN.pdf?fileId=5546d462576f34750157750826c42242) and a resistor ladder used to monitor the VBATT battery line voltage level.
 
 ### Comma-separated Fields
 | Description   |                                        |
@@ -106,8 +106,8 @@ This record logs pressure information captured from the
 | $PENV         | Record identifier                      |
 | millis() timestamp | Time of sample in milliseconds    |
 | static air  pressure       | expressed in hPa         |
-| estimated altitude | based on static air pressure reading for a standard day; expressed in feet         |
-| VBATT voltage      | battery voltage level (3.5V - 3.8V typ.); sampled once every 30 seconds; 
+| estimated altitude | based on static air pressure reading assuming a Standard Day; expressed in feet, MSL   |
+| VBATT voltage      | battery voltage level (3.5V - 3.8V typ.); sampled once every 30 seconds; (not used on Tempo-BT)
 battery voltage isn't reported  on Tempo boards: the value will be set to -1    |
 
 ### $PENV Example
@@ -173,11 +173,11 @@ Sensor records are written to the file at these rates:
 |:----------------:|:---------------------------------|
 |  PVER            | appears as the first line of a log file |
 |  PSFC            | follows the PVER sentence |
-|  GNSS position report            |       2 Hz |
-|  PIMU            |      40 Hz |
+|  GNSS position report  |  10 Hz in Jump mode, 1 Hz otherwise; GGA, VTG, RMC, GSA sentences |
+|  PIMU            |      50 Hz |
 |  PIM2            | follows each $PIMU sentence|
 |  PENV            |       4 Hz    |
-|  PTH             | follows each GGA and VTG record|
+|  PTH             | follows each GGA and VTG record |
 |  PST             | at each internal state change in the logger |
 
 Valid for version 55/155 and later

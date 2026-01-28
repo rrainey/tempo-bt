@@ -16,7 +16,7 @@
 /* Aggregator configuration */
 typedef struct {
     /* Output rates in Hz */
-    uint16_t imu_output_rate;      /* Target rate for $PIMU sentences (40 Hz) */
+    uint16_t imu_output_rate;      /* Target rate for $PIMU sentences (50 Hz) */
     uint16_t env_output_rate;      /* Target rate for $PENV sentences (4 Hz) */
     uint16_t gnss_output_rate;     /* Target rate for GNSS (1 Hz) */
     uint16_t mag_output_rate;      /* Target rate for $PMAG sentences (0 = disabled) */
