@@ -212,6 +212,24 @@ int gnss_init_skydiving(void);
 void gnss_set_session_start_time(uint64_t start_us);
 
 /**
+ * @brief Enable GNSS time pulse output
+ *
+ * Configures the SAM-M10Q to output a 1 Hz time pulse on the TIMEPULSE pin.
+ * The pulse is aligned to GPS time-of-week when locked, and runs at 1 Hz
+ * regardless of lock status.
+ *
+ * Configuration:
+ * - Period: 1,000,000 us (1 Hz)
+ * - Pulse length: 100,000 us (100ms high, 900ms low)
+ * - Time grid: GPS
+ * - Aligned to TOW when locked
+ * - Rising edge polarity
+ *
+ * @return 0 on success, negative error code on failure
+ */
+int gnss_enable_timepulse(void);
+
+/**
  * @brief Check if GNSS has a valid position fix
  *
  * A valid fix requires fix_quality > 0 and at least 3 satellites.

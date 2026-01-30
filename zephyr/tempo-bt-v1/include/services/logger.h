@@ -52,14 +52,22 @@ typedef struct {
 int logger_init(const logger_config_t *config);
 
 /**
- * @brief Start a new logging session
+ * @brief Start a new logging session, enter LOGGING state
  * 
  * @return 0 on success, negative error code on failure
  */
 int logger_start(void);
 
 /**
- * @brief Stop current logging session
+ * @brief Switch from LOGGING to JUMPED state
+ * 
+ * @return 0 on success, negative error code on failure
+ */
+int logger_jumped(void);
+
+
+/**
+ * @brief Stop current logging session, return to ARMED state
  * 
  * @return 0 on success, negative error code on failure
  */

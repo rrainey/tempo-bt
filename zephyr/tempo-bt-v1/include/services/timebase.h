@@ -81,14 +81,42 @@ bool timebase_mono_to_utc(uint64_t mono_us, uint64_t *utc_ms);
 bool timebase_get_correlation(time_correlation_t *corr);
 
 /**
- * @brief Check if PPS is locked (V2 feature)
- * 
- * @return Always false on V1 hardware
+ * @brief PPS pulse data structure
+ *
+ * Contains the current PPS pulse count and the system timestamp
+ * at the time of the query.
  */
-static inline bool timebase_pps_locked(void)
-{
-    return false;  /* No PPS on V1 */
-}
+typedef struct {
+    uint32_t pulse_count;      /* Number of PPS pulses received since init */
+    uint64_t timestamp_us;     /* System time when this data was captured */
+} timebase_pps_data_t;
+
+/**
+ * @brief Initialize PPS interrupt handling
+ *
+ * Configures GPIO P0.27 for rising edge interrupt from GNSS time pulse.
+ * Also configures the red LED (led1) for visual feedback.
+ *
+ * @return 0 on success, negative error code on failure
+ */
+int timebase_pps_init(void);
+
+/**
+ * @brief Get current PPS data
+ *
+ * Returns the current pulse count and system timestamp atomically.
+ * The pulse count increments on each rising edge of the GNSS time pulse.
+ *
+ * @param data Output: PPS pulse count and timestamp
+ */
+void timebase_get_pps_data(timebase_pps_data_t *data);
+
+/**
+ * @brief Check if PPS pulses are being received
+ *
+ * @return true if PPS pulses have been received, false otherwise
+ */
+bool timebase_pps_active(void);
 
 /**
  * @brief Get UTC time string placeholder

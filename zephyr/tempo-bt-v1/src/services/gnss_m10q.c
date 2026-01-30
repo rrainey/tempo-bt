@@ -1331,6 +1331,13 @@ int gnss_init(void)
 
     LOG_INF("NMEA messages re-enabled");
 
+    /* Enable time pulse output for PPS synchronization */
+    ret = gnss_enable_timepulse();
+    if (ret < 0) {
+        LOG_WRN("Failed to enable time pulse: %d", ret);
+        /* Continue anyway - time pulse is not critical for basic operation */
+    }
+
     return 0;
 }
 
@@ -1912,6 +1919,89 @@ bool gnss_has_fix(void)
 bool gnss_time_is_set(void)
 {
     return gnss_time_set_flag;
+}
+
+/*
+ * Enable GNSS time pulse (PPS) output
+ *
+ * Configures the SAM-M10Q TIMEPULSE pin for 1 Hz output using UBX-CFG-VALSET.
+ * The pulse is aligned to GPS TOW when locked, and runs at 1 Hz regardless.
+ */
+int gnss_enable_timepulse(void)
+{
+    int ret;
+
+    /*
+     * UBX-CFG-VALSET payload structure:
+     * - version (1 byte): 0x00
+     * - layers (1 byte): 0x01 = RAM only
+     * - reserved (2 bytes): 0x00 0x00
+     * - cfgData: key-value pairs
+     *
+     * Key format: 4 bytes little-endian
+     * Value size depends on key type prefix:
+     *   0x10 = L (1 byte bool)
+     *   0x20 = U1 (1 byte)
+     *   0x40 = U4 (4 bytes)
+     */
+    static const uint8_t timepulse_cfg[] = {
+        /* Header */
+        0x00,                   /* version */
+        0x01,                   /* layers: RAM only */
+        0x00, 0x00,             /* reserved */
+
+        /* CFG-TP-TP1_ENA (0x10050001) = 1 (enable) */
+        0x01, 0x00, 0x05, 0x10,
+        0x01,
+
+        /* CFG-TP-PERIOD_TP1 (0x40050002) = 1000000 us */
+        0x02, 0x00, 0x05, 0x40,
+        0x40, 0x42, 0x0F, 0x00, /* 1000000 = 0x000F4240 */
+
+        /* CFG-TP-PERIOD_LOCK_TP1 (0x40050003) = 1000000 us */
+        0x03, 0x00, 0x05, 0x40,
+        0x40, 0x42, 0x0F, 0x00,
+
+        /* CFG-TP-LEN_TP1 (0x40050004) = 100000 us */
+        0x04, 0x00, 0x05, 0x40,
+        0xA0, 0x86, 0x01, 0x00, /* 100000 = 0x000186A0 */
+
+        /* CFG-TP-LEN_LOCK_TP1 (0x40050005) = 100000 us */
+        0x05, 0x00, 0x05, 0x40,
+        0xA0, 0x86, 0x01, 0x00,
+
+        /* CFG-TP-TIMEGRID_TP1 (0x20050007) = 1 (GPS) */
+        0x07, 0x00, 0x05, 0x20,
+        0x01,
+
+        /* CFG-TP-ALIGN_TO_TOW_TP1 (0x10050008) = 1 */
+        0x08, 0x00, 0x05, 0x10,
+        0x01,
+
+        /* CFG-TP-PULSE_LENGTH_DEF (0x20050009) = 0 (Period) */
+        0x09, 0x00, 0x05, 0x20,
+        0x00,
+
+        /* CFG-TP-USE_LOCKED_TP1 (0x1005000A) = 1 */
+        0x0A, 0x00, 0x05, 0x10,
+        0x01,
+
+        /* CFG-TP-POL_TP1 (0x1005000B) = 1 (rising edge) */
+        0x0B, 0x00, 0x05, 0x10,
+        0x01,
+    };
+
+    LOG_INF("Enabling GNSS time pulse (1 Hz)");
+
+    /* Send configuration using UBX-CFG-VALSET (class 0x06, id 0x8A) */
+    ret = ubx_send_with_ack(0x06, 0x8A, timepulse_cfg, sizeof(timepulse_cfg));
+    if (ret < 0) {
+        LOG_ERR("Failed to configure time pulse: %d", ret);
+        return ret;
+    }
+
+    LOG_INF("GNSS time pulse enabled successfully");
+    return 0;
 }
 
 #ifdef CONFIG_RTC

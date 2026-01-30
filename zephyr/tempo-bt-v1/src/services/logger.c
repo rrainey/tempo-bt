@@ -290,12 +290,55 @@ int logger_start(void)
         .payload.session.id = logger_state.session_id
     };
     event_bus_publish(&evt);
+
+    /* GNSS stays at 1 Hz during climb */
+    gnss_set_rate(1);
+    executive_reset_counters();
     
     LOG_INF("Logging started: session=%08x, path=%s", 
             logger_state.session_id, logger_state.session_path);
     
     return 0;
 }
+
+int logger_jumped(void)
+{
+    k_mutex_lock(&logger_state.lock, K_FOREVER);
+
+    if (logger_state.state != LOGGER_STATE_LOGGING) {
+        LOG_WRN("Cannot mark jumped from state %s",
+                state_to_string(logger_state.state));
+        k_mutex_unlock(&logger_state.lock);
+        return -EINVAL;
+    }
+    
+    LOG_INF("Marking jump event in logging session");
+    
+    logger_state_t old_state = logger_state.state;
+    logger_state.state = LOGGER_STATE_JUMPED;
+    
+    k_mutex_unlock(&logger_state.lock);
+
+    /*
+     * Transition to higher frequency position reporting
+     */
+    gnss_set_rate(10);
+    executive_reset_counters();
+
+    /* Log state change */
+    aggregator_write_state_change(state_to_string(old_state),
+                                    state_to_string(LOGGER_STATE_JUMPED),
+                                    "freefall_detected");
+    /* Emit event */
+    app_event_t evt = {
+        .type = EVT_STATE_CHANGE,
+        .payload.state_change.old_state = old_state,
+        .payload.state_change.new_state = LOGGER_STATE_JUMPED
+    };
+    event_bus_publish(&evt);
+    
+    return 0;
+}   
 
 int logger_stop(void)
 {
@@ -723,9 +766,7 @@ static void executive_handle_armed_state(float climb_rate)
             /* Transition to LOGGING state */
             int ret = logger_start();
             if (ret == 0) {
-                /* GNSS stays at 1 Hz during climb */
-                gnss_set_rate(1);
-                executive_reset_counters();
+                
             } else {
                 LOG_ERR("Failed to start logging: %d", ret);
             }
@@ -757,28 +798,7 @@ static void executive_handle_logging_state(float climb_rate)
             LOG_INF("Executive: Freefall detected! climb_rate=%.2f m/s (%.0f ft/min)",
                     climb_rate, climb_rate * 196.85f);
 
-            /* Transition to JUMPED state */
-            k_mutex_lock(&logger_state.lock, K_FOREVER);
-            logger_state_t old_state = logger_state.state;
-            logger_state.state = LOGGER_STATE_JUMPED;
-            k_mutex_unlock(&logger_state.lock);
-
-            /* Increase GNSS rate to 10 Hz for maximum position accuracy */
-            gnss_set_rate(10);
-            executive_reset_counters();
-
-            /* Log state change */
-            aggregator_write_state_change(state_to_string(old_state),
-                                          state_to_string(LOGGER_STATE_JUMPED),
-                                          "freefall_detected");
-
-            /* Emit event */
-            app_event_t evt = {
-                .type = EVT_STATE_CHANGE,
-                .payload.state_change.old_state = old_state,
-                .payload.state_change.new_state = LOGGER_STATE_JUMPED
-            };
-            event_bus_publish(&evt);
+            logger_jumped();
         }
     } else {
         executive_state.freefall_confirm_count = 0;
