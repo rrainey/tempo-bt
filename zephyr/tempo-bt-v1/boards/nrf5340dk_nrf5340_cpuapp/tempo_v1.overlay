@@ -106,8 +106,17 @@
     sdcard_detect: sdcard_detect {
         compatible = "gpio-keys";
         sdcard_detect_pin: sdcard_detect_pin {
-            gpios = <&gpio1 12 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>; 
+            gpios = <&gpio1 12 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
             label = "SD card detect";
+        };
+    };
+
+    /* GNSS Time Pulse (PPS) input from SAM-M10Q */
+    gnss_pps: gnss_pps {
+        compatible = "gpio-keys";
+        gnss_timepulse: gnss_timepulse_pin {
+            gpios = <&gpio0 27 GPIO_ACTIVE_HIGH>;
+            label = "GNSS timepulse";
         };
     };
 
