@@ -17,9 +17,81 @@
 #include "services/storage.h"
 #include "services/logger.h"
 #include "services/led.h"
+#include "services/timebase.h"
 #include "config/settings.h"
 
 LOG_MODULE_REGISTER(mcumgr_custom, LOG_LEVEL_INF);
+
+/*
+ * Test Alarm State Machine
+ *
+ * Used by TEMPO_MGMT_ID_TEST_LOGGING to synchronize logging start
+ * across multiple Tempo-BT devices using the GNSS PPS signal.
+ * State values are defined as macros in timebase.h:
+ *   TEST_ALARM_IDLE, TEST_ALARM_WAITING_START, TEST_ALARM_WAITING_JUMP
+ */
+
+/* Test alarm configuration - accessed by timebase.c via accessor functions */
+static struct {
+    int state;                     /* TEST_ALARM_IDLE/WAITING_START/WAITING_JUMP */
+    uint64_t target_start_utc_ms;  /* UTC time to start logging (ms since epoch) */
+    uint32_t jump_delay_sec;       /* Seconds after start to trigger jump (0-3600) */
+    uint32_t jump_countdown;       /* Current countdown in seconds */
+} test_alarm = {
+    .state = TEST_ALARM_IDLE,
+    .target_start_utc_ms = 0,
+    .jump_delay_sec = 0,
+    .jump_countdown = 0
+};
+
+/*
+ * Test alarm accessor functions - called from timebase.c PPS handler
+ */
+
+/* Get current test alarm state */
+int test_alarm_get_state(void)
+{
+    return test_alarm.state;
+}
+
+/* Get target start time in UTC milliseconds */
+uint64_t test_alarm_get_target_utc_ms(void)
+{
+    return test_alarm.target_start_utc_ms;
+}
+
+/* Get jump delay in seconds */
+uint32_t test_alarm_get_jump_delay(void)
+{
+    return test_alarm.jump_delay_sec;
+}
+
+/* Get current jump countdown value */
+uint32_t test_alarm_get_jump_countdown(void)
+{
+    return test_alarm.jump_countdown;
+}
+
+/* Set test alarm state */
+void test_alarm_set_state(int state)
+{
+    test_alarm.state = state;
+}
+
+/* Initialize jump countdown from delay value */
+void test_alarm_start_jump_countdown(void)
+{
+    test_alarm.jump_countdown = test_alarm.jump_delay_sec;
+}
+
+/* Decrement jump countdown, returns new value */
+uint32_t test_alarm_decrement_countdown(void)
+{
+    if (test_alarm.jump_countdown > 0) {
+        test_alarm.jump_countdown--;
+    }
+    return test_alarm.jump_countdown;
+}
 
 /* Custom group ID */
 #define MGMT_GROUP_ID_TEMPO    64
@@ -33,6 +105,8 @@ LOG_MODULE_REGISTER(mcumgr_custom, LOG_LEVEL_INF);
 #define TEMPO_MGMT_ID_SESSION_DELETE   5
 #define TEMPO_MGMT_ID_SETTINGS_GET     6
 #define TEMPO_MGMT_ID_SETTINGS_SET     7
+#define TEMPO_MGMT_ID_GET_DATETIME     8
+#define TEMPO_MGMT_ID_TEST_LOGGING     9
 
 /* List callback context */
 struct list_context {
@@ -713,7 +787,172 @@ static int tempo_mgmt_settings_set(struct smp_streamer *ctxt)
     if (!ok) {
         return MGMT_ERR_EMSGSIZE;
     }
-    
+
+    return 0;
+}
+
+/* Get current UTC datetime as ISO 8601 string */
+static int tempo_mgmt_get_datetime(struct smp_streamer *ctxt)
+{
+    zcbor_state_t *zse = ctxt->writer->zs;
+    char datetime_buf[32];
+
+    int ret = timebase_get_utc_iso8601(datetime_buf, sizeof(datetime_buf));
+    if (ret != 0) {
+        /* No valid UTC time available */
+        bool ok = zcbor_tstr_put_lit(zse, "error") &&
+                  zcbor_tstr_put_lit(zse, "No valid UTC time") &&
+                  zcbor_tstr_put_lit(zse, "datetime") &&
+                  zcbor_tstr_put_lit(zse, "");
+
+        if (!ok) {
+            return MGMT_ERR_EMSGSIZE;
+        }
+        return 0;
+    }
+
+    bool ok = zcbor_tstr_put_lit(zse, "datetime") &&
+              zcbor_tstr_put_term(zse, datetime_buf, sizeof(datetime_buf));
+
+    if (!ok) {
+        return MGMT_ERR_EMSGSIZE;
+    }
+
+    LOG_INF("Get datetime: %s", datetime_buf);
+
+    return 0;
+}
+
+/* Test logging command - schedule synchronized logging start */
+static int tempo_mgmt_test_logging(struct smp_streamer *ctxt)
+{
+    zcbor_state_t *zsd = ctxt->reader->zs;
+    zcbor_state_t *zse = ctxt->writer->zs;
+
+    bool ok;
+    struct zcbor_string key;
+    struct zcbor_string start_str;
+    uint32_t jump_value = 0;
+    bool has_start = false;
+    bool has_jump = false;
+
+    /* Start decoding the map */
+    ok = zcbor_map_start_decode(zsd);
+    if (!ok) {
+        LOG_ERR("Failed to start decoding map");
+        return MGMT_ERR_EINVAL;
+    }
+
+    /* Decode parameters: {"start": "MMSS", "jump": nn} */
+    while (zcbor_tstr_decode(zsd, &key)) {
+        if (key.len == 5 && memcmp(key.value, "start", 5) == 0) {
+            ok = zcbor_tstr_decode(zsd, &start_str);
+            if (ok && start_str.len == 4) {
+                has_start = true;
+            }
+        }
+        else if (key.len == 4 && memcmp(key.value, "jump", 4) == 0) {
+            ok = zcbor_uint32_decode(zsd, &jump_value);
+            if (ok) {
+                has_jump = true;
+            }
+        }
+        else {
+            ok = zcbor_any_skip(zsd, NULL);
+        }
+
+        if (!ok) {
+            LOG_ERR("Failed to decode value");
+            return MGMT_ERR_EINVAL;
+        }
+    }
+
+    ok = zcbor_map_end_decode(zsd);
+    if (!ok) {
+        LOG_ERR("Failed to end decoding map");
+        return MGMT_ERR_EINVAL;
+    }
+
+    if (!has_start) {
+        LOG_ERR("Missing 'start' parameter");
+        return MGMT_ERR_EINVAL;
+    }
+
+    /* Validate jump delay (0-3600 seconds) */
+    if (has_jump && jump_value > 3600) {
+        LOG_ERR("Jump delay exceeds maximum (3600 seconds)");
+        return MGMT_ERR_EINVAL;
+    }
+
+    /* Parse MMSS format */
+    uint32_t mm = (start_str.value[0] - '0') * 10 + (start_str.value[1] - '0');
+    uint32_t ss = (start_str.value[2] - '0') * 10 + (start_str.value[3] - '0');
+
+    if (mm > 59 || ss > 59) {
+        LOG_ERR("Invalid start time: %02u:%02u", mm, ss);
+        return MGMT_ERR_EINVAL;
+    }
+
+    /* Get current UTC time */
+    time_correlation_t corr;
+    if (!timebase_get_correlation(&corr) || !corr.valid) {
+        LOG_ERR("No valid UTC time correlation");
+        ok = zcbor_tstr_put_lit(zse, "success") &&
+             zcbor_bool_put(zse, false) &&
+             zcbor_tstr_put_lit(zse, "error") &&
+             zcbor_tstr_put_lit(zse, "No valid UTC time");
+
+        if (!ok) {
+            return MGMT_ERR_EMSGSIZE;
+        }
+        return 0;
+    }
+
+    /* Calculate target UTC time in milliseconds */
+    uint64_t current_utc_ms = corr.utc_ms;
+
+    /* Get current hour start (truncate to hour boundary) */
+    uint64_t ms_per_hour = 3600ULL * 1000ULL;
+    uint64_t current_hour_start = (current_utc_ms / ms_per_hour) * ms_per_hour;
+
+    /* Calculate target time within hour */
+    uint64_t target_offset_ms = (mm * 60ULL + ss) * 1000ULL;
+    uint64_t target_utc_ms = current_hour_start + target_offset_ms;
+
+    /* If target time has passed in current hour, schedule for next hour */
+    if (target_utc_ms <= current_utc_ms) {
+        target_utc_ms += ms_per_hour;
+        LOG_INF("Target time passed, scheduling for next hour");
+    }
+
+    /* Calculate seconds until start */
+    uint32_t seconds_until_start = (uint32_t)((target_utc_ms - current_utc_ms) / 1000);
+
+    /* Set up the test alarm */
+    test_alarm.target_start_utc_ms = target_utc_ms;
+    test_alarm.jump_delay_sec = has_jump ? jump_value : 0;
+    test_alarm.jump_countdown = 0;
+    test_alarm.state = TEST_ALARM_WAITING_START;
+
+    LOG_INF("Test logging scheduled: start=%02u:%02u (%u sec), jump=%u sec",
+            mm, ss, seconds_until_start, test_alarm.jump_delay_sec);
+
+    /* Build response */
+    ok = zcbor_tstr_put_lit(zse, "success") &&
+         zcbor_bool_put(zse, true) &&
+         zcbor_tstr_put_lit(zse, "start_mm") &&
+         zcbor_uint32_put(zse, mm) &&
+         zcbor_tstr_put_lit(zse, "start_ss") &&
+         zcbor_uint32_put(zse, ss) &&
+         zcbor_tstr_put_lit(zse, "seconds_until_start") &&
+         zcbor_uint32_put(zse, seconds_until_start) &&
+         zcbor_tstr_put_lit(zse, "jump_delay") &&
+         zcbor_uint32_put(zse, test_alarm.jump_delay_sec);
+
+    if (!ok) {
+        return MGMT_ERR_EMSGSIZE;
+    }
+
     return 0;
 }
 
@@ -750,6 +989,14 @@ static const struct mgmt_handler tempo_mgmt_handlers[] = {
     [TEMPO_MGMT_ID_SETTINGS_SET] = {
         .mh_read = NULL,
         .mh_write = tempo_mgmt_settings_set,
+    },
+    [TEMPO_MGMT_ID_GET_DATETIME] = {
+        .mh_read = tempo_mgmt_get_datetime,
+        .mh_write = NULL,
+    },
+    [TEMPO_MGMT_ID_TEST_LOGGING] = {
+        .mh_read = NULL,
+        .mh_write = tempo_mgmt_test_logging,
     },
 };
 

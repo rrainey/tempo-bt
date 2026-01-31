@@ -2,6 +2,9 @@
 
 A Zephyr RTOS-based flight data logging system for the nRF5340 platform, designed for capturing high-frequency sensor data during skydiving and other aerial activities. The system logs IMU, barometric, GPS, and optional magnetometer data to SD card or internal flash storage, with Bluetooth LE connectivity for wireless data transfer and configuration.
 
+![Tempo-BT-V2](../../images/V2-render-02.png
+)
+
 ## Table of Contents
 
 - [Features](#features)
@@ -157,9 +160,10 @@ Log files are in extended NMEA sentence format with NMEA-style checksums. Key se
 - `$PFIX`: GPS fix information
 - `$PST`: State changes
 - `$PMAG`: Magnetometer data (optional)
-- `$GNGGL` : Fix, from u-blox receiver
 - `$GNVTG` : track made good, from u-blox receiver
 - `$GNGGA` : Fix, from u-blox receiver
+- `$GNGSV` : Satellite data, from u-blox receiver
+- `$GNRMC` : Fix, time, track, from u-blox receiver
 
 Example log excerpt:
 ```

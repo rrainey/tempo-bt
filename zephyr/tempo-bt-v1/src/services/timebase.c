@@ -8,8 +8,10 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/time_units.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/posix/time.h>
 
 #include "services/timebase.h"
+#include "services/logger.h"
 
 LOG_MODULE_REGISTER(timebase, LOG_LEVEL_INF);
 
@@ -34,6 +36,9 @@ static struct gpio_callback pps_cb_data;
 
 /* Delayed work for turning off LED after 100ms */
 static struct k_work_delayable pps_led_off_work;
+
+/* Work item for test alarm processing (called from PPS context) */
+static struct k_work test_alarm_work;
 
 /* Flag indicating PPS system is initialized */
 static bool pps_initialized = false;
@@ -138,6 +143,98 @@ bool timebase_get_correlation(time_correlation_t *corr)
 }
 
 /*
+ * Get current UTC time in milliseconds
+ * Returns 0 if no valid correlation
+ */
+static uint64_t get_current_utc_ms(void)
+{
+    uint64_t utc_ms = 0;
+    if (timebase_mono_to_utc(time_now_us(), &utc_ms)) {
+        return utc_ms;
+    }
+    return 0;
+}
+
+/*
+ * Test alarm work handler
+ * Called from work queue context on each PPS pulse to check alarm state
+ * and trigger logger state transitions at the appropriate times.
+ */
+static void test_alarm_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    int state = test_alarm_get_state();
+    if (state == TEST_ALARM_IDLE) {
+        return;  /* No alarm active */
+    }
+
+    uint64_t current_utc_ms = get_current_utc_ms();
+    if (current_utc_ms == 0) {
+        LOG_WRN("Test alarm: no valid UTC time");
+        return;
+    }
+
+    if (state == TEST_ALARM_WAITING_START) {
+        uint64_t target_ms = test_alarm_get_target_utc_ms();
+
+        if (current_utc_ms >= target_ms) {
+            LOG_INF("Test alarm: start time reached, triggering LOGGING");
+
+            /* Auto-arm if needed, then start logging */
+            logger_state_t logger_state = logger_get_state();
+            int ret = 0;
+
+            if (logger_state == LOGGER_STATE_IDLE) {
+                ret = logger_arm();
+                if (ret != 0) {
+                    LOG_ERR("Test alarm: failed to arm logger: %d", ret);
+                    test_alarm_set_state(TEST_ALARM_IDLE);
+                    return;
+                }
+            }
+
+            ret = logger_start();
+            if (ret != 0) {
+                LOG_ERR("Test alarm: failed to start logger: %d", ret);
+                test_alarm_set_state(TEST_ALARM_IDLE);
+                return;
+            }
+
+            /* Transition to waiting for jump */
+            uint32_t jump_delay = test_alarm_get_jump_delay();
+            if (jump_delay > 0) {
+                test_alarm_start_jump_countdown();
+                test_alarm_set_state(TEST_ALARM_WAITING_JUMP);
+                LOG_INF("Test alarm: now counting down %u seconds to JUMPED",
+                        jump_delay);
+            } else {
+                /* No jump delay, we're done */
+                test_alarm_set_state(TEST_ALARM_IDLE);
+                LOG_INF("Test alarm: complete (no jump delay)");
+            }
+        }
+    } else if (state == TEST_ALARM_WAITING_JUMP) {
+        uint32_t remaining = test_alarm_decrement_countdown();
+
+        if (remaining == 0) {
+            LOG_INF("Test alarm: jump countdown complete, triggering JUMPED");
+
+            int ret = logger_jumped();
+            if (ret != 0) {
+                LOG_ERR("Test alarm: failed to trigger jumped: %d", ret);
+            }
+
+            /* Alarm sequence complete */
+            test_alarm_set_state(TEST_ALARM_IDLE);
+            LOG_INF("Test alarm: sequence complete");
+        } else if ((remaining % 10) == 0 || remaining <= 5) {
+            LOG_INF("Test alarm: %u seconds until JUMPED", remaining);
+        }
+    }
+}
+
+/*
  * PPS LED off work handler
  * Called 100ms after PPS pulse to turn off the green LED
  */
@@ -175,6 +272,9 @@ static void pps_gpio_callback(const struct device *dev, struct gpio_callback *cb
 
     /* Schedule LED off after 100ms */
     k_work_reschedule(&pps_led_off_work, K_MSEC(100));
+
+    /* Schedule test alarm check (runs in work queue context) */
+    k_work_submit(&test_alarm_work);
 }
 
 int timebase_pps_init(void)
@@ -234,6 +334,9 @@ int timebase_pps_init(void)
     /* Initialize delayed work for LED off */
     k_work_init_delayable(&pps_led_off_work, pps_led_off_handler);
 
+    /* Initialize test alarm work */
+    k_work_init(&test_alarm_work, test_alarm_work_handler);
+
     pps_initialized = true;
     LOG_INF("PPS subsystem initialized");
 
@@ -260,4 +363,42 @@ bool timebase_pps_active(void)
 const char *timebase_utc_string_placeholder(void)
 {
     return "unknown";
+}
+
+int timebase_get_utc_iso8601(char *buf, size_t buf_size)
+{
+    if (!buf || buf_size < 25) {
+        return -EINVAL;
+    }
+
+    uint64_t utc_ms = get_current_utc_ms();
+    if (utc_ms == 0) {
+        return -EAGAIN;  /* No valid UTC correlation */
+    }
+
+    /* Convert milliseconds since epoch to time components */
+    time_t utc_sec = (time_t)(utc_ms / 1000);
+    uint32_t tenths = (uint32_t)((utc_ms % 1000) / 100);  /* 0.1s resolution */
+
+    struct tm tm_buf;
+    struct tm *tm = gmtime_r(&utc_sec, &tm_buf);
+    if (!tm) {
+        return -EINVAL;
+    }
+
+    /* Format as ISO 8601: YYYY-MM-DDTHH:MM:SS.dZ */
+    int len = snprintf(buf, buf_size, "%04d-%02d-%02dT%02d:%02d:%02d.%uZ",
+                       tm->tm_year + 1900,
+                       tm->tm_mon + 1,
+                       tm->tm_mday,
+                       tm->tm_hour,
+                       tm->tm_min,
+                       tm->tm_sec,
+                       tenths);
+
+    if (len < 0 || (size_t)len >= buf_size) {
+        return -ENOMEM;
+    }
+
+    return 0;
 }

@@ -153,9 +153,14 @@ flowchart TB
 ### 3.2 System state (RAM, owned by logger service)
 
 * **Logger state** (`logger_state_t`) serves as the primary system state:
-  * States: `IDLE` → `ARMED` → `LOGGING` → `ERROR`
+  * States: `IDLE` → `ARMED` → `LOGGING` → `JUMPED` → `POSTFLIGHT` → `ERROR`
   * Manages session lifecycle and health metrics
   * Thread-safe access via mutex
+
+* **Test alarm state** (in `mcumgr_custom.c`):
+  * States: `TEST_ALARM_IDLE`, `TEST_ALARM_WAITING_START`, `TEST_ALARM_WAITING_JUMP`
+  * Target UTC time and jump delay parameters
+  * Processed by `timebase.c` on each PPS pulse
 
 * **Sensor caches** (in respective services):
   * **BARO**: last pressure/temp, altitude estimate, ground reference
@@ -183,6 +188,9 @@ flowchart TB
 * Provides `time_now_us()` (64-bit monotonic)
 * Maintains GNSS time correlation: updated by GNSS sentences
 * Sets system RTC (`CLOCK_REALTIME`) from GPS time for date-stamped directories
+* **PPS (Pulse Per Second)**: Handles GNSS 1Hz time pulse interrupt for precise timing
+* **ISO 8601 datetime**: `timebase_get_utc_iso8601()` returns current UTC as `YYYY-MM-DDTHH:MM:SS.dZ`
+* **Test alarm processing**: PPS-triggered work handler for synchronized multi-device testing
 
 ### 4.2 `imu_icm42688`
 
@@ -230,13 +238,15 @@ flowchart TB
 
 ### 4.7 `logger`
 
-* **Session state machine**: IDLE → ARMED → LOGGING → ERROR
+* **Session state machine**: IDLE → ARMED → LOGGING → JUMPED → POSTFLIGHT → ERROR
 * **Takeoff detection**: Monitors barometer for climb rate and altitude change
+* **Freefall detection**: Monitors descent rate to trigger LOGGING → JUMPED transition
 * **Session management**:
   * Creates date-based directories using GPS date
   * UUID-based filenames
   * Writes header (PVER, PSFC) at session start
 * **Button control integration**: Armed/disarmed via long press, start/stop via short press
+* **Executive function**: Handles automatic state transitions based on flight phase detection
 
 ### 4.8 `file_writer`
 
@@ -271,6 +281,36 @@ flowchart TB
 * Standard mcumgr file transfer over BLE SMP
 * File list/get/delete operations
 * Dynamic device name support (`CONFIG_BT_DEVICE_NAME_DYNAMIC`)
+
+**Custom Tempo Commands** (Group ID 64):
+
+| ID | Command | Type | Description |
+|----|---------|------|-------------|
+| 0 | `SESSION_LIST` | Read | List logging sessions |
+| 2 | `STORAGE_INFO` | Read | Get storage backend and free space |
+| 3 | `LED_CONTROL` | Write | Set RGB LED color override |
+| 4 | `LOGGER_CONTROL` | Write | Start/stop/arm/disarm logger |
+| 5 | `SESSION_DELETE` | Write | Delete a logging session |
+| 6 | `SETTINGS_GET` | Read | Get NVM settings (BLE name, PPS, PCB variant) |
+| 7 | `SETTINGS_SET` | Write | Update NVM settings |
+| 8 | `GET_DATETIME` | Read | Get current UTC as ISO 8601 (`YYYY-MM-DDTHH:MM:SS.dZ`) |
+| 9 | `TEST_LOGGING` | Write | Schedule synchronized logging test (see below) |
+
+**TEST_LOGGING Command**:
+
+Used for multi-device synchronized testing via GNSS PPS signal.
+
+* **Request**: `{"start": "MMSS", "jump": nn}`
+  * `start`: Minutes and seconds within current UTC hour to begin logging
+  * `jump`: Seconds after start to transition to JUMPED state (0-3600)
+* **Response**: `{success, start_mm, start_ss, seconds_until_start, jump_delay}`
+* **Behavior**:
+  * Requires valid GNSS time correlation (returns error if unavailable)
+  * If MMSS has passed in current hour, schedules for next hour
+  * Auto-arms logger if in IDLE state
+  * PPS interrupt triggers `logger_start()` at exact second boundary
+  * After `jump` seconds, triggers `logger_jumped()` for state transition
+  * Logger executive handles session closure after landing detection
 
 ---
 
@@ -318,10 +358,14 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> IDLE
     IDLE --> ARMED: long-press Button 0
+    IDLE --> LOGGING: TEST_LOGGING alarm (auto-arms)
     ARMED --> IDLE: long-press Button 0
     ARMED --> LOGGING: short-press or takeoff detected
+    ARMED --> LOGGING: TEST_LOGGING alarm
+    LOGGING --> JUMPED: freefall detected or TEST_LOGGING jump timer
     LOGGING --> IDLE: short-press (manual stop)
     LOGGING --> ERROR: storage/sensor error
+    JUMPED --> IDLE: landing detected (executive)
     ERROR --> IDLE: recovery
 ```
 
@@ -334,6 +378,12 @@ stateDiagram-v2
 - Monitors barometer climb rate and altitude change
 - Triggers ARMED → LOGGING transition automatically
 - Configurable via `auto_start_on_takeoff` in logger config
+
+**Test Alarm Synchronization (mcumgr TEST_LOGGING):**
+- Schedules LOGGING start at specific UTC wall clock time (MMSS within hour)
+- Uses GNSS PPS signal for precise 1-second boundary triggering
+- Enables simultaneous logging start across multiple Tempo-BT devices
+- Optional jump delay triggers LOGGING → JUMPED transition after N seconds
 
 Transitions emit `$PST` records with trigger reasons.
 
@@ -381,12 +431,15 @@ All sentences end with `*HH\r\n` where HH is XOR checksum of characters between 
 - ✓ BMP390 barometer (8 Hz, takeoff detection)
 - ✓ SAM-M10Q GNSS (1-10 Hz, UBX config, airborne 4g mode)
 - ✓ Orientation tracking (Fusion AHRS - ready for IMU)
-- ✓ Logger state machine (IDLE/ARMED/LOGGING/ERROR)
+- ✓ Logger state machine (IDLE/ARMED/LOGGING/JUMPED/ERROR)
 - ✓ Button controls (short/long press)
 - ✓ RGB LED status indication
 - ✓ Event bus for state notifications
 - ✓ Date-stamped log directories (GPS date)
 - ✓ Async file writer (ring buffer + worker thread)
+- ✓ Custom mcumgr commands (session/storage/LED/logger/settings control)
+- ✓ PPS-synchronized test logging (multi-device synchronization)
+- ✓ UTC datetime query (ISO 8601 format)
 
 ### Not Working / Pending
 - ✗ ICM42688 IMU (hardware WHO_AM_I mismatch)
@@ -419,11 +472,12 @@ CONFIG_UART_ASYNC_API=y
 
 ## TL;DR
 
-* **Logger service** owns system state (IDLE → ARMED → LOGGING)
+* **Logger service** owns system state (IDLE → ARMED → LOGGING → JUMPED)
 * **Aggregator** builds NMEA sentences from sensor ring buffers
 * **File writer** uses Zephyr ring buffer + worker thread for async I/O
-* **GNSS** provides position + time; early quiet prevents boot overruns
+* **GNSS** provides position + time; PPS signal enables precise timing
 * **Barometer** provides altitude + takeoff detection
 * **Orientation** ready for IMU data (Fusion AHRS algorithm)
 * **Button 0** controls arming (long) and start/stop (short)
 * **LED** indicates state via color (blue=idle, orange=armed, green=logging, red=error)
+* **mcumgr** provides BLE commands for session management, settings, and synchronized test logging

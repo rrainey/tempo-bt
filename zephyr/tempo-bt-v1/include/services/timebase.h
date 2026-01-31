@@ -120,12 +120,46 @@ bool timebase_pps_active(void);
 
 /**
  * @brief Get UTC time string placeholder
- * 
+ *
  * Returns "unknown" until GNSS provides valid time
  * Used by aggregator for $PTH sentences when UTC is not available
- * 
+ *
  * @return "unknown" string
  */
 const char *timebase_utc_string_placeholder(void);
+
+/**
+ * @brief Get current UTC time as ISO 8601 string
+ *
+ * Formats current UTC time as "YYYY-MM-DDTHH:MM:SS.dZ" with 0.1s resolution.
+ * Requires valid GNSS time correlation.
+ *
+ * @param buf Output buffer for the ISO 8601 string (minimum 25 bytes)
+ * @param buf_size Size of the output buffer
+ * @return 0 on success, -EAGAIN if no valid UTC correlation
+ */
+int timebase_get_utc_iso8601(char *buf, size_t buf_size);
+
+/*
+ * Test Alarm Interface
+ *
+ * Used by mcumgr TEST_LOGGING command to synchronize logging start
+ * across multiple Tempo-BT devices using the GNSS PPS signal.
+ * State and parameters are stored in mcumgr_custom.c
+ */
+
+/* Test alarm states - must match enum in mcumgr_custom.c */
+#define TEST_ALARM_IDLE           0  /* No test alarm active */
+#define TEST_ALARM_WAITING_START  1  /* Waiting for start time to trigger LOGGING */
+#define TEST_ALARM_WAITING_JUMP   2  /* In LOGGING, counting down to JUMPED */
+
+/* Accessor functions implemented in mcumgr_custom.c */
+int test_alarm_get_state(void);
+uint64_t test_alarm_get_target_utc_ms(void);
+uint32_t test_alarm_get_jump_delay(void);
+uint32_t test_alarm_get_jump_countdown(void);
+void test_alarm_set_state(int state);
+void test_alarm_start_jump_countdown(void);
+uint32_t test_alarm_decrement_countdown(void);
 
 #endif /* SERVICES_TIMEBASE_H */

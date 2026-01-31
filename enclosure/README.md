@@ -21,7 +21,7 @@ Two M2.5 brass inserts must be installed in the bottom half of the enclosure. M2
 | Quantity | Part Name | MFR Part Number | 
 |---|---|---|
 | 1 | Tempo BT V2 Board | NA |
-| 1 | 3.7V 850mAH LiPo Battery | [13854](https://www.digikey.com/en/products/detail/sparkfun-electronics/13854/6605201) |
+| 1 | 3.7V 850mAh LiPo Battery | [13854](https://www.digikey.com/en/products/detail/sparkfun-electronics/13854/6605201) |
 | 2 | Heat-Set Insert: M2.5-0.45 Thread Size | [1GNL7](https://www.grainger.com/product/Heat-Set-Insert-M2-5-0-45-1GNL7?searchQuery=1GNL7&searchBar=true) |
 | 2 | Machine screw: M2.5x0.45 Thread Size, 5 mm | [1-mpp-2.5-5](https://www.grainger.com/product/Machine-Screw-M2-5x0-45-Thread-856Z30) |
 | 1 | Enclosure Shell Bottom, PLA | Enclosure-Bottom.step |
