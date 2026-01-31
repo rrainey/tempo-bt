@@ -1,206 +1,205 @@
-# Tempo Arduino Logger - Altitude Estimation and State Machine Analysis
+# Tempo-BT V1 - Flight Detection and State Machine Algorithms
 
 ## Overview
-This document analyzes the surface altitude estimator and application state transition algorithms from the Arduino implementation of the Tempo skydiving logger (version 0.155).
 
-## Surface Altitude Estimator
+This document describes the algorithms used in the Tempo-BT V1 Zephyr implementation for flight phase detection and automatic state management. The system uses a combination of barometric pressure sensing and accelerometer data to detect takeoff, freefall, and landing events.
 
-### Implementation
-The surface altitude estimation in the current implementation is extremely simple:
-
-```c
-// When we're in WAIT mode, we can use the altitude
-// to set ground altitude.
-nHGround_feet = dAlt_ft;
-```
-
-### Algorithm Characteristics
-- **Continuous Update**: While in `STATE_WAIT`, the system continuously updates `nHGround_feet` with the current pressure altitude
-- **No Filtering**: Raw altitude reading is used directly without averaging or filtering
-- **Last Known Value**: Ground altitude is simply the last altitude reading before takeoff
-- **No Validation**: No checks for stability or outliers
-
-## Vertical Speed (HDOT) Computation
-
-### Algorithm Implementation
-```c
-void updateHDot(float H_feet) {
-    uint32_t ulMillis = millis();
-    int nLastHSample_feet;
-    int nInterval_ms = ulMillis - ulLastHSampleMillis;
-
-    /* update HDot every ten seconds */
-    if (nInterval_ms > 10000) {
-        if (!bFirstPressureSample) {
-            // Get previous sample from circular buffer
-            if (nNextHSample == 0) {
-                nLastHSample_feet = nHSample[NUM_H_SAMPLES-1];
-            } else {
-                nLastHSample_feet = nHSample[nNextHSample-1];
-            }
-            
-            // Store current altitude
-            nHSample[nNextHSample] = H_feet;
-            
-            // Calculate vertical speed in feet per minute
-            nHDotSample[nNextHSample] = (((long) H_feet - nLastHSample_feet) * 60000L) / nInterval_ms;
-            nHDot_fpm = nHDotSample[nNextHSample];
-        }
-        else {
-            // First sample - no rate calculation possible
-            bFirstPressureSample = false;
-            nHSample[nNextHSample] = H_feet;
-            nHDotSample[nNextHSample] = 0;
-            nHDot_fpm = 0;
-        }
-
-        ulLastHSampleMillis = ulMillis;
-        if (++nNextHSample >= NUM_H_SAMPLES) {
-            nNextHSample = 0;
-        }
-    }
-}
-```
-
-### Key Features
-- **Update Rate**: Every 10 seconds (quite coarse for dynamic activities)
-- **Buffer Size**: Circular buffer of 5 samples (`NUM_H_SAMPLES`)
-- **Calculation Method**: Simple finite difference: `(current_alt - previous_alt) * 60000 / time_interval_ms`
-- **Units**: Feet per minute (fpm)
-- **Filtering**: None - raw difference calculation
-
-## State Machine Design
+## State Machine
 
 ### State Definitions
+
 ```c
-#define STATE_WAIT       0  // On ground, gathering baseline data
-#define STATE_IN_FLIGHT  1  // Aircraft climbing
-#define STATE_JUMPING    2  // In freefall
-#define STATE_LANDED_1   3  // Just landed, waiting to confirm
+typedef enum {
+    LOGGER_STATE_IDLE,       // Device idle, not monitoring
+    LOGGER_STATE_ARMED,      // Monitoring for takeoff
+    LOGGER_STATE_LOGGING,    // In-flight, recording data
+    LOGGER_STATE_JUMPED,     // Freefall/canopy descent detected
+    LOGGER_STATE_POSTFLIGHT, // Post-flight processing
+    LOGGER_STATE_ERROR       // Error condition
+} logger_state_t;
+```
+
+### State Transition Diagram
+
+```
+                    ┌──────────────┐
+                    │     IDLE     │
+                    └──────┬───────┘
+                           │ logger_arm()
+                    ┌──────▼───────┐
+              ┌────►│    ARMED     │◄────────────────────┐
+              │     └──────┬───────┘                     │
+              │            │ Climb rate > 200 ft/min     │
+              │            │ for 3 consecutive seconds   │
+              │     ┌──────▼───────┐                     │
+              │     │   LOGGING    │                     │
+              │     └──────┬───────┘                     │
+              │            │ Freefall detected:          │
+              │            │ • Baro: < -1000 ft/min 2s   │
+              │            │ • Accel: < 0.6g for 500ms   │
+              │     ┌──────▼───────┐                     │
+              │     │    JUMPED    │                     │
+              │     └──────┬───────┘                     │
+              │            │ Low activity for 60s        │
+              └────────────┴─────────────────────────────┘
+                           │
+              (6 min timeout in LOGGING also returns to ARMED)
 ```
 
 ### Transition Thresholds
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `EXEC_TAKEOFF_CLIMB_RATE_MPS` | 1.016 m/s | 200 ft/min - triggers ARMED→LOGGING |
+| `EXEC_FREEFALL_DESCENT_RATE_MPS` | -5.08 m/s | -1000 ft/min - triggers LOGGING→JUMPED (baro method) |
+| `EXEC_FREEFALL_ACCEL_THRESHOLD_G` | 0.6g | Low-g threshold for freefall (accel method) |
+| `EXEC_LOW_ACTIVITY_RATE_MPS` | 1.016 m/s | |200 ft/min| - low activity threshold |
+| `EXEC_JUMPED_TIMEOUT_S` | 60s | Low activity duration to detect landing |
+| `EXEC_LOGGING_ABORT_TIMEOUT_S` | 360s | 6 min low activity in LOGGING aborts session |
+
+### Executive Function
+
+The executive function (`logger_executive()`) runs every **250ms** and manages automatic state transitions. This faster interval (compared to the original 1s) enables more responsive freefall detection.
+
+## Climb Rate Estimation
+
+### Alpha-Beta Filter
+
+The system uses an alpha-beta filter (also known as a g-h filter) for coupled altitude/velocity estimation from barometric pressure data. This approach provides better transient rejection than simple derivative-based methods.
+
+**Filter Parameters:**
+- `ALPHA_BETA_ALPHA = 0.15` - Position (altitude) correction weight
+- `ALPHA_BETA_BETA = 0.005` - Velocity (climb rate) correction weight
+
+These values provide approximately 1-2 second time constant for good transient rejection while maintaining reasonable responsiveness.
+
+**Algorithm:**
+
 ```c
-#define OPS_HDOT_THRESHOLD_FPM       300   // Climbing threshold
-#define OPS_HDOT_LAND_THRESHOLD_FPM  100   // Landing detection
-#define OPS_HDOT_JUMPING_FPM         -800  // Freefall detection
+// Predict step: advance state using current velocity estimate
+altitude_pred = altitude_est + climb_rate_est * dt;
+
+// Update step: correct prediction using measurement residual
+residual = measured_altitude - altitude_pred;
+altitude_est = altitude_pred + ALPHA * residual;
+climb_rate_est = climb_rate_est + (BETA / dt) * residual;
 ```
 
-### State Transition Logic
+### Median Pre-Filter
 
-#### WAIT → IN_FLIGHT
-- **Trigger**: Vertical speed > 300 fpm (climbing)
-- **Actions**:
-  - Open new log file with timestamp
-  - Start IMU logging at 100 Hz
-  - Enable periodic file flushing
-  - Activate LED blinking pattern
-  - Record session start time
+Before the alpha-beta filter, a 3-sample median filter is applied to reject single-sample outliers in the barometric altitude measurements:
 
-#### IN_FLIGHT → JUMPING
-- **Trigger**: Vertical speed < -800 fpm (rapid descent)
-- **Actions**:
-  - Increase GNSS update rate from 1 Hz to 4 Hz
-  - Disable GSA/GSV NMEA sentences (reduce data overhead)
-
-#### JUMPING → LANDED_1
-- **Trigger**: |Vertical speed| < 100 fpm (nearly stationary)
-- **Actions**:
-  - Start 30-second confirmation timer
-  - Continue logging while confirming landing
-
-#### LANDED_1 State Transitions
-Three possible outcomes:
-
-1. **LANDED_1 → JUMPING** (False landing)
-   - **Trigger**: Vertical speed < -800 fpm
-   - **Actions**: Cancel timer, return to freefall state
-
-2. **LANDED_1 → IN_FLIGHT** (False landing)
-   - **Trigger**: |Vertical speed| > 300 fpm
-   - **Actions**: Cancel timer, return to flight state
-
-3. **LANDED_1 → WAIT** (Confirmed landing)
-   - **Trigger**: 30-second timer expires with no motion
-   - **Actions**:
-     - Reduce GNSS to 0.5 Hz
-     - Re-enable GSA/GSV sentences
-     - Stop IMU logging
-     - Close log file
-     - Clear LED indicators
-
-### State Machine Diagram
-```
-         ┌──────────┐
-         │   WAIT   │
-         └─────┬────┘
-               │ HDOT > 300 fpm
-         ┌─────▼────────┐
-         │  IN_FLIGHT   │
-         └─────┬────────┘
-               │ HDOT < -800 fpm
-         ┌─────▼────────┐
-         │   JUMPING    │
-         └─────┬────────┘
-               │ |HDOT| < 100 fpm
-         ┌─────▼────────┐
-         │  LANDED_1    │──┐
-         │  (30s timer) │  │ HDOT < -800 fpm
-         └─────┬────────┘  │ or |HDOT| > 300 fpm
-               │           │
-               │ Timer     │
-               │ expires   │
-         ┌─────▼────────┐  │
-         │    WAIT      │◄─┘
-         └──────────────┘
+```c
+filtered_altitude = median3(buffer[0], buffer[1], buffer[2]);
 ```
 
-## Strengths of Current Implementation
+### Data Flow
 
-1. **Simple and Robust**: Easy to understand and debug
-2. **Hysteresis**: Different thresholds prevent state oscillation
-3. **Landing Confirmation**: 30-second timer prevents false stops
-4. **Resource Management**: Adaptive GNSS rates optimize power/data
-5. **Clear State Actions**: Well-defined entry/exit behaviors
+```
+Barometric       Median         Alpha-Beta        Executive
+Altitude    ──►  Pre-filter ──► Filter       ──►  Function
+(~50 Hz)         (3 samples)    (position +       (250ms interval)
+                                velocity)
+```
 
-## Areas for Improvement
+## Freefall Detection
 
-### Surface Altitude Estimation
-- Add averaging window during WAIT state
-- Implement outlier rejection
-- Consider pressure trend analysis
-- Add temperature compensation
-- Store multiple ground references for different locations
+The system implements two parallel methods for detecting freefall, with the accelerometer method providing faster response:
 
-### Vertical Speed Calculation
-- Increase update frequency (1 Hz or higher)
-- Implement sliding window averaging
-- Add Kalman filtering for smoother estimates
-- Use accelerometer data for faster response
-- Consider GPS vertical velocity as supplementary input
+### Method 1: Barometric (Descent Rate)
 
-### State Machine Enhancements
-- Add altitude-based conditions (minimum altitude for jump detection)
-- Implement "CANOPY" state for under-canopy flight
-- Add GPS groundspeed to landing detection
-- Log state transitions with timestamps and reasons
-- Consider barometric pressure rate-of-change
-- Add error states for sensor failures
+- **Threshold:** Descent rate exceeds 1000 ft/min (5.08 m/s)
+- **Confirmation:** 2 consecutive seconds (8 executive ticks)
+- **Latency:** ~2 seconds from jump initiation
 
-### Additional Considerations
-- Implement pre-flight calibration sequence
-- Add manual state override capability
-- Store state history for post-flight analysis
-- Consider wind effects on ground detection
-- Add configurable thresholds for different use cases
+### Method 2: Accelerometer (Low-G)
 
-## Implementation Notes for Zephyr Migration
+- **Threshold:** Filtered acceleration magnitude < 0.6g
+- **Confirmation:** 2 consecutive readings at 250ms intervals (500ms total)
+- **Latency:** ~500ms from jump initiation
 
-When porting to the Zephyr-based system:
+The accelerometer method triggers state transition to JUMPED significantly faster, allowing earlier capture of high-rate GNSS position data during freefall.
 
-1. **Use Zephyr's built-in filtering libraries** for altitude and rate calculations
-2. **Implement state machine using Zephyr's SM framework** for better structure
-3. **Add configuration via Kconfig** for thresholds and timing
-4. **Use work queues** for periodic altitude sampling
-5. **Implement proper sensor fusion** combining baro, GPS, and IMU data
-6. **Add comprehensive logging** of state transitions and decision factors
+### Accelerometer Magnitude Filtering
+
+The IMU service maintains an EMA-filtered acceleration magnitude when enabled:
+
+**Filter Parameters:**
+- Sample rate: 200 Hz (ICM42688 FIFO)
+- `ACCEL_MAG_FILTER_ALPHA = 0.15` - ~33ms time constant
+
+**Algorithm:**
+
+```c
+// Compute magnitude in g
+magnitude_g = sqrt(ax_g² + ay_g² + az_g²);
+
+// EMA filter update
+filtered_magnitude = α * magnitude + (1-α) * filtered_magnitude_prev;
+```
+
+The filter is enabled when entering LOGGING state and disabled when logging stops, minimizing computational overhead during non-flight periods.
+
+## Ground Altitude Tracking
+
+### Continuous Sampling
+
+During IDLE and ARMED states, the system periodically samples barometric altitude to maintain an accurate ground reference:
+
+- **Sampling interval:** Every 5 minutes (300 seconds)
+- **Storage:** Moving average maintained by baro service
+
+### Initial Calibration
+
+When arming, the current barometric altitude is captured as the initial ground reference if not already set.
+
+## Takeoff Detection
+
+Takeoff is detected by monitoring for sustained positive climb rate:
+
+- **Threshold:** > 200 ft/min (1.016 m/s)
+- **Confirmation:** 3 consecutive seconds (12 executive ticks at 250ms)
+- **Result:** Automatic transition from ARMED to LOGGING
+
+## Landing Detection
+
+Landing is detected by monitoring for sustained low vertical activity:
+
+- **Threshold:** |climb rate| < 200 ft/min (1.016 m/s)
+- **Confirmation:** 60 seconds of continuous low activity
+- **Result:** Automatic transition from JUMPED to ARMED
+
+## GNSS Rate Management
+
+The system dynamically adjusts GNSS update rate based on flight phase:
+
+| State | GNSS Rate | Rationale |
+|-------|-----------|-----------|
+| IDLE/ARMED | 1 Hz | Power conservation |
+| LOGGING | 1 Hz | Sufficient for aircraft climb |
+| JUMPED | 10 Hz | High-rate position capture during freefall/canopy |
+
+## Timing Summary
+
+| Component | Update Rate | Purpose |
+|-----------|-------------|---------|
+| IMU FIFO | 200 Hz | Orientation tracking, accel filtering |
+| Barometric | ~50 Hz | Altitude/pressure measurement |
+| Alpha-beta filter | Per baro sample | Climb rate estimation |
+| Accel magnitude filter | Per IMU sample | Freefall detection |
+| Executive function | 4 Hz (250ms) | State transition decisions |
+| Ground altitude sample | Every 5 min | Ground reference update |
+
+## Implementation Files
+
+| File | Purpose |
+|------|---------|
+| `src/services/logger.c` | State machine, executive function, baro handler |
+| `src/services/imu_icm42688.c` | Acceleration magnitude filter |
+| `src/services/baro.c` | Barometric sampling, ground altitude tracking |
+| `src/services/orientation.c` | IMU FIFO processing, quaternion estimation |
+
+## References
+
+- Alpha-beta filter theory: [PMC4179067](https://pmc.ncbi.nlm.nih.gov/articles/PMC4179067/)
+- ICM42688 datasheet for accelerometer specifications

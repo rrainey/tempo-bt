@@ -87,14 +87,15 @@ tempo-bt/
 - ✓ RGB LED status (PWM-based, state indication)
 - ✓ Button controls (short/long press handling)
 - ✓ BLE file transfer (mcumgr)
-- ✗ ICM42688 IMU (hardware issues - WHO_AM_I mismatch)
+- ✓ ICM42688 IMU (200Hz FIFO, filtered accel magnitude for freefall detection)
+- ✓ Flight phase detection (takeoff, freefall, landing)
 - ✗ MMC5983MA magnetometer (not integrated)
 
 ```mermaid
 flowchart TB
   subgraph App["Application Layer"]
-    Main[main.c\nButton handlers\nInit sequence]
-    Logger[Logger Service\nSession state machine\nTakeoff detection]
+    Main[main.c\nButton handlers\nExecutive loop 250ms]
+    Logger[Logger Service\nState machine\nFlight phase detection]
     LED[LED Service\nPWM RGB status]
   end
 
@@ -106,20 +107,22 @@ flowchart TB
   end
 
   subgraph Drivers["Sensor + IO Drivers"]
-    IMU[ICM42688 SPI]
-    BARO[BMP390 I²C]
-    GNSS[SAM-M10Q UART]
+    IMU[ICM42688 SPI\n200Hz FIFO\nFiltered accel mag]
+    BARO[BMP390 I²C\nAlpha-beta filter]
+    GNSS[SAM-M10Q UART\n1-10Hz dynamic]
     Storage[SD Card FAT]
   end
 
   Main --> Logger
   Main --> LED
   Logger --> Agg
-  IMU --> Agg --> Orient
+  IMU --> Orient
+  IMU --> Logger
   BARO --> Agg
   BARO --> Logger
   GNSS --> Agg
   Tm --> Agg
+  Orient --> Agg
 
   Agg --> Writer --> Storage
 ```
@@ -194,9 +197,13 @@ flowchart TB
 
 ### 4.2 `imu_icm42688`
 
-* Configures ODR, full-scale ranges; enables FIFO + INT1
-* SPI bursts on INT; enqueues batches to aggregator ring buffer
-* **Status**: Hardware issues (WHO_AM_I mismatch) - not functional on current boards
+* Configures ODR (200 Hz), full-scale ranges; enables FIFO streaming
+* SPI bursts to read FIFO; polled by orientation service at 50 Hz (20ms)
+* **Filtered acceleration magnitude API** for freefall detection:
+  * `imu_enable_accel_filter()` / `imu_disable_accel_filter()` - enable/disable filtering
+  * `imu_get_filtered_acceleration()` - get EMA-filtered magnitude in g
+  * EMA filter with α=0.15 (~33ms time constant at 200Hz)
+  * Enabled automatically when entering LOGGING state
 
 ### 4.3 `baro_bmp390`
 
@@ -239,14 +246,26 @@ flowchart TB
 ### 4.7 `logger`
 
 * **Session state machine**: IDLE → ARMED → LOGGING → JUMPED → POSTFLIGHT → ERROR
-* **Takeoff detection**: Monitors barometer for climb rate and altitude change
-* **Freefall detection**: Monitors descent rate to trigger LOGGING → JUMPED transition
+* **Executive function** (runs every 250ms):
+  * Manages automatic state transitions based on flight phase detection
+  * Uses alpha-beta filter for climb rate estimation from barometric data
+  * Median pre-filter (3 samples) for altitude outlier rejection
+* **Takeoff detection** (ARMED → LOGGING):
+  * Threshold: Climb rate > 200 ft/min (1.016 m/s)
+  * Confirmation: 3 consecutive seconds
+* **Freefall detection** (LOGGING → JUMPED) - dual methods:
+  * **Barometric**: Descent rate < -1000 ft/min for 2 seconds
+  * **Accelerometer**: Magnitude < 0.6g for 500ms (2 readings at 250ms) - *faster response*
+* **Landing detection** (JUMPED → ARMED):
+  * Threshold: |climb rate| < 200 ft/min
+  * Confirmation: 60 seconds of low activity
+* **Abort timeout** (LOGGING → ARMED):
+  * If no jump detected after 6 minutes of low activity, returns to ARMED
 * **Session management**:
   * Creates date-based directories using GPS date
   * UUID-based filenames
   * Writes header (PVER, PSFC) at session start
 * **Button control integration**: Armed/disarmed via long press, start/stop via short press
-* **Executive function**: Handles automatic state transitions based on flight phase detection
 
 ### 4.8 `file_writer`
 
@@ -360,24 +379,32 @@ stateDiagram-v2
     IDLE --> ARMED: long-press Button 0
     IDLE --> LOGGING: TEST_LOGGING alarm (auto-arms)
     ARMED --> IDLE: long-press Button 0
-    ARMED --> LOGGING: short-press or takeoff detected
+    ARMED --> LOGGING: short-press or takeoff detected (3s climb)
     ARMED --> LOGGING: TEST_LOGGING alarm
-    LOGGING --> JUMPED: freefall detected or TEST_LOGGING jump timer
+    LOGGING --> JUMPED: freefall detected (baro 2s or accel 500ms)
+    LOGGING --> JUMPED: TEST_LOGGING jump timer
+    LOGGING --> ARMED: 6 min low activity (abort)
     LOGGING --> IDLE: short-press (manual stop)
     LOGGING --> ERROR: storage/sensor error
-    JUMPED --> IDLE: landing detected (executive)
+    JUMPED --> ARMED: landing detected (60s low activity)
+    JUMPED --> IDLE: short-press (manual stop)
     ERROR --> IDLE: recovery
 ```
 
 **Button Controls (main.c):**
 - **Button 0 long press** (2 seconds): Toggle IDLE ↔ ARMED
-- **Button 0 short press**: Start logging (when ARMED) or stop logging (when LOGGING)
+- **Button 0 short press**: Start logging (when ARMED) or stop logging (when LOGGING/JUMPED)
 - **Button 1**: Reserved for future use
 
-**Automatic Takeoff Detection:**
-- Monitors barometer climb rate and altitude change
-- Triggers ARMED → LOGGING transition automatically
-- Configurable via `auto_start_on_takeoff` in logger config
+**Automatic Flight Phase Detection (executive function @ 250ms):**
+
+| Transition | Method | Threshold | Confirmation |
+|------------|--------|-----------|--------------|
+| ARMED → LOGGING | Barometric climb | > 200 ft/min | 3 seconds |
+| LOGGING → JUMPED | Barometric descent | < -1000 ft/min | 2 seconds |
+| LOGGING → JUMPED | Accelerometer low-g | < 0.6g | 500ms (faster) |
+| LOGGING → ARMED | Low activity abort | \|rate\| < 200 ft/min | 6 minutes |
+| JUMPED → ARMED | Landing detection | \|rate\| < 200 ft/min | 60 seconds |
 
 **Test Alarm Synchronization (mcumgr TEST_LOGGING):**
 - Schedules LOGGING start at specific UTC wall clock time (MMSS within hour)
@@ -430,7 +457,8 @@ All sentences end with `*HH\r\n` where HH is XOR checksum of characters between 
 - ✓ BLE file transfer (mcumgr)
 - ✓ BMP390 barometer (8 Hz, takeoff detection)
 - ✓ SAM-M10Q GNSS (1-10 Hz, UBX config, airborne 4g mode)
-- ✓ Orientation tracking (Fusion AHRS - ready for IMU)
+- ✓ ICM42688 IMU (200 Hz FIFO, orientation tracking, filtered accel magnitude)
+- ✓ Orientation tracking (Fusion AHRS with IMU data)
 - ✓ Logger state machine (IDLE/ARMED/LOGGING/JUMPED/ERROR)
 - ✓ Button controls (short/long press)
 - ✓ RGB LED status indication
@@ -440,12 +468,14 @@ All sentences end with `*HH\r\n` where HH is XOR checksum of characters between 
 - ✓ Custom mcumgr commands (session/storage/LED/logger/settings control)
 - ✓ PPS-synchronized test logging (multi-device synchronization)
 - ✓ UTC datetime query (ISO 8601 format)
+- ✓ **Flight phase detection** (executive function @ 250ms):
+  - Takeoff detection (barometric climb rate)
+  - Freefall detection (dual: barometric descent + accelerometer low-g)
+  - Landing detection (sustained low vertical activity)
+  - Session abort (6 min timeout in LOGGING without jump)
 
 ### Not Working / Pending
-- ✗ ICM42688 IMU (hardware WHO_AM_I mismatch)
 - ✗ MMC5983MA magnetometer (not integrated)
-- ✗ Advanced flight phase detection
-- ✗ Auto-landing detection
 
 ---
 
@@ -473,11 +503,16 @@ CONFIG_UART_ASYNC_API=y
 ## TL;DR
 
 * **Logger service** owns system state (IDLE → ARMED → LOGGING → JUMPED)
+* **Executive function** (250ms) handles automatic flight phase detection:
+  - Takeoff: 3s sustained climb > 200 ft/min
+  - Freefall: Baro descent < -1000 ft/min (2s) OR accel < 0.6g (500ms)
+  - Landing: 60s low activity after jump
+* **IMU service** provides 200Hz accel/gyro + filtered acceleration magnitude for freefall
 * **Aggregator** builds NMEA sentences from sensor ring buffers
 * **File writer** uses Zephyr ring buffer + worker thread for async I/O
-* **GNSS** provides position + time; PPS signal enables precise timing
-* **Barometer** provides altitude + takeoff detection
-* **Orientation** ready for IMU data (Fusion AHRS algorithm)
+* **GNSS** provides position + time; PPS signal enables precise timing; 10Hz during freefall
+* **Barometer** provides altitude + climb rate via alpha-beta filter
+* **Orientation** uses Fusion AHRS for quaternion output from IMU
 * **Button 0** controls arming (long) and start/stop (short)
 * **LED** indicates state via color (blue=idle, orange=armed, green=logging, red=error)
 * **mcumgr** provides BLE commands for session management, settings, and synchronized test logging
