@@ -98,4 +98,26 @@ int imu_get_config(imu_config_t *config);
  */
 uint64_t time_now_us(void);
 
+/**
+ * @brief Enable filtered acceleration magnitude tracking
+ *
+ * When enabled, the IMU service maintains an EMA-filtered acceleration
+ * magnitude (in g) that can be queried for freefall detection.
+ * The filter runs at the IMU sample rate (typically 200Hz).
+ */
+void imu_enable_accel_filter(void);
+
+/**
+ * @brief Disable filtered acceleration magnitude tracking
+ */
+void imu_disable_accel_filter(void);
+
+/**
+ * @brief Get current filtered acceleration magnitude
+ *
+ * @param magnitude_g Pointer to store filtered magnitude in g
+ * @return 0 on success, -EINVAL if pointer is NULL, -EAGAIN if filter not ready
+ */
+int imu_get_filtered_acceleration(float *magnitude_g);
+
 #endif /* SERVICES_IMU_H */

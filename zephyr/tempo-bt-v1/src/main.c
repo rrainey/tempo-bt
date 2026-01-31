@@ -687,12 +687,12 @@ int main(void)
         update_led_for_state(LOGGER_STATE_ARMED);
     }
 
-    /* Main loop - call logger executive every 1 second */
+    /* Main loop - call logger executive every 250ms for responsive freefall detection */
     while (1) {
         /* Logger executive manages automatic state transitions */
         logger_executive();
 
-        k_sleep(K_SECONDS(1));
+        k_sleep(K_MSEC(250));
     }
     
     return 0;

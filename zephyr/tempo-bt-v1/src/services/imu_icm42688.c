@@ -12,6 +12,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/sys/byteorder.h>
+#include <math.h>
 
 #include "services/imu.h"
 #include "services/timebase.h"
@@ -95,6 +96,19 @@ static imu_config_t current_config = {
     .accel_range_g = 8,
     .gyro_range_dps = 500
 };
+
+/* Filtered acceleration magnitude state
+ * EMA filter with alpha ~0.15 gives ~33ms time constant at 200Hz
+ * This provides good noise rejection while remaining responsive for freefall detection
+ */
+#define ACCEL_MAG_FILTER_ALPHA  0.15f
+
+static struct {
+    float filtered_magnitude_g;  /* Filtered acceleration magnitude in g */
+    bool enabled;                /* Filter enabled flag */
+    bool initialized;            /* First sample received flag */
+    struct k_spinlock lock;      /* Spinlock for thread-safe access */
+} accel_filter_state;
 
 /* Sensitivity values based on current config */
 static float accel_sensitivity;  /* LSB per m/s^2 */
@@ -496,6 +510,28 @@ int imu_fifo_read(imu_sample_t *samples, size_t max_count)
         samples[valid_count].gyro_z  = (float)gyro_z / gyro_sensitivity;
         samples[valid_count].temperature = 25.0f + ((float)temp_raw / 2.07f);
 
+        /* Update filtered acceleration magnitude if enabled */
+        if (accel_filter_state.enabled) {
+            /* Compute magnitude in g (accel values are in m/s², divide by 9.80665) */
+            float ax_g = samples[valid_count].accel_x / 9.80665f;
+            float ay_g = samples[valid_count].accel_y / 9.80665f;
+            float az_g = samples[valid_count].accel_z / 9.80665f;
+            float magnitude_g = sqrtf(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
+
+            k_spinlock_key_t key = k_spin_lock(&accel_filter_state.lock);
+            if (!accel_filter_state.initialized) {
+                /* First sample - initialize directly */
+                accel_filter_state.filtered_magnitude_g = magnitude_g;
+                accel_filter_state.initialized = true;
+            } else {
+                /* EMA filter update */
+                accel_filter_state.filtered_magnitude_g =
+                    ACCEL_MAG_FILTER_ALPHA * magnitude_g +
+                    (1.0f - ACCEL_MAG_FILTER_ALPHA) * accel_filter_state.filtered_magnitude_g;
+            }
+            k_spin_unlock(&accel_filter_state.lock, key);
+        }
+
         /* Estimate timestamp: oldest sample first, working forward */
         samples[valid_count].timestamp_us = now_us -
             ((packets_to_read - 1 - valid_count) * sample_period_us);
@@ -513,5 +549,47 @@ int imu_get_config(imu_config_t *config)
     }
 
     *config = current_config;
+    return 0;
+}
+
+/*
+ * Filtered acceleration magnitude API
+ */
+
+void imu_enable_accel_filter(void)
+{
+    k_spinlock_key_t key = k_spin_lock(&accel_filter_state.lock);
+    accel_filter_state.enabled = true;
+    accel_filter_state.initialized = false;
+    accel_filter_state.filtered_magnitude_g = 0.0f;
+    k_spin_unlock(&accel_filter_state.lock, key);
+
+    LOG_INF("Acceleration magnitude filter enabled (alpha=%.2f)", ACCEL_MAG_FILTER_ALPHA);
+}
+
+void imu_disable_accel_filter(void)
+{
+    k_spinlock_key_t key = k_spin_lock(&accel_filter_state.lock);
+    accel_filter_state.enabled = false;
+    accel_filter_state.initialized = false;
+    k_spin_unlock(&accel_filter_state.lock, key);
+
+    LOG_INF("Acceleration magnitude filter disabled");
+}
+
+int imu_get_filtered_acceleration(float *magnitude_g)
+{
+    if (!magnitude_g) {
+        return -EINVAL;
+    }
+
+    k_spinlock_key_t key = k_spin_lock(&accel_filter_state.lock);
+    if (!accel_filter_state.enabled || !accel_filter_state.initialized) {
+        k_spin_unlock(&accel_filter_state.lock, key);
+        return -EAGAIN;  /* Filter not ready */
+    }
+    *magnitude_g = accel_filter_state.filtered_magnitude_g;
+    k_spin_unlock(&accel_filter_state.lock, key);
+
     return 0;
 }

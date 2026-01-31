@@ -19,6 +19,7 @@
 #include "services/timebase.h"
 #include "services/baro.h"
 #include "services/gnss.h"
+#include "services/imu.h"
 #include "app/events.h"
 
 LOG_MODULE_REGISTER(logger, LOG_LEVEL_INF);
@@ -40,6 +41,18 @@ LOG_MODULE_REGISTER(logger, LOG_LEVEL_INF);
 #define EXEC_LOW_ACTIVITY_RATE_MPS      1.016f   /* |200 ft/min| - low activity threshold */
 #define EXEC_JUMPED_TIMEOUT_S           60       /* 60s low activity in JUMPED -> ARMED */
 #define EXEC_LOGGING_ABORT_TIMEOUT_S    360      /* 6 min low activity in LOGGING -> ARMED */
+
+/* Accelerometer-based freefall detection
+ * Threshold: < 0.6g for 2 consecutive readings at 250ms intervals (500ms total)
+ */
+#define EXEC_FREEFALL_ACCEL_THRESHOLD_G 0.6f     /* Below 0.6g indicates freefall */
+#define EXEC_FREEFALL_ACCEL_CONFIRM     2        /* 2 consecutive readings at 250ms = 500ms */
+
+/* Executive interval adjustment factor
+ * Executive now runs at 250ms intervals instead of 1s (4x faster)
+ * Time-based counters need to account for this
+ */
+#define EXEC_TICKS_PER_SECOND           4        /* 250ms interval = 4 ticks per second */
 
 /* Alpha-beta filter parameters for climb rate estimation
  * These values provide ~1-2 second time constant for good transient rejection
@@ -79,12 +92,13 @@ static struct {
     uint8_t median_index;
     uint8_t median_count;
 
-    /* Low-activity timeout tracking */
-    uint32_t low_activity_counter_s;
+    /* Low-activity timeout tracking (in executive ticks, not seconds) */
+    uint32_t low_activity_counter;
 
     /* Transition confirmation counters (debouncing) */
     uint8_t takeoff_confirm_count;
     uint8_t freefall_confirm_count;
+    uint8_t low_accel_confirm_count;  /* Accelerometer-based freefall detection */
 
     /* Thread safety */
     struct k_mutex exec_mutex;
@@ -294,10 +308,13 @@ int logger_start(void)
     /* GNSS stays at 1 Hz during climb */
     gnss_set_rate(1);
     executive_reset_counters();
-    
-    LOG_INF("Logging started: session=%08x, path=%s", 
+
+    /* Enable accelerometer magnitude filtering for freefall detection */
+    imu_enable_accel_filter();
+
+    LOG_INF("Logging started: session=%08x, path=%s",
             logger_state.session_id, logger_state.session_path);
-    
+
     return 0;
 }
 
@@ -354,12 +371,15 @@ int logger_stop(void)
     }
     
     LOG_INF("Stopping logging session");
-    
+
     logger_state_t old_state = logger_state.state;
     logger_state.state = LOGGER_STATE_IDLE;
-    
+
     k_mutex_unlock(&logger_state.lock);
-    
+
+    /* Disable accelerometer magnitude filtering */
+    imu_disable_accel_filter();
+
     /* Write final state change */
     aggregator_write_state_change(state_to_string(old_state),
                                   state_to_string(LOGGER_STATE_IDLE),
@@ -712,7 +732,8 @@ static const char *state_to_string(logger_state_t state)
  * Executive function implementation
  *
  * The executive manages automatic state transitions based on barometric
- * rate of climb. It should be called every 1 second from the main loop.
+ * rate of climb and accelerometer magnitude. It should be called every
+ * 250ms from the main loop for responsive freefall detection.
  */
 
 /* Initialize executive state */
@@ -731,11 +752,12 @@ static void executive_init(void)
     executive_state.median_count = 0;
 
     /* Executive counters */
-    executive_state.low_activity_counter_s = 0;
+    executive_state.low_activity_counter = 0;
     executive_state.takeoff_confirm_count = 0;
     executive_state.freefall_confirm_count = 0;
+    executive_state.low_accel_confirm_count = 0;
 
-    LOG_INF("Logger executive initialized (alpha-beta filter: alpha=%.3f, beta=%.4f)",
+    LOG_INF("Logger executive initialized (alpha-beta filter: alpha=%.3f, beta=%.4f, exec interval=250ms)",
             ALPHA_BETA_ALPHA, ALPHA_BETA_BETA);
 }
 
@@ -743,9 +765,10 @@ static void executive_init(void)
 static void executive_reset_counters(void)
 {
     k_mutex_lock(&executive_state.exec_mutex, K_FOREVER);
-    executive_state.low_activity_counter_s = 0;
+    executive_state.low_activity_counter = 0;
     executive_state.takeoff_confirm_count = 0;
     executive_state.freefall_confirm_count = 0;
+    executive_state.low_accel_confirm_count = 0;
     k_mutex_unlock(&executive_state.exec_mutex);
 }
 
@@ -755,19 +778,18 @@ static void executive_handle_armed_state(float climb_rate)
     /* Check for sustained positive climb rate indicating takeoff */
     if (climb_rate > EXEC_TAKEOFF_CLIMB_RATE_MPS) {
         executive_state.takeoff_confirm_count++;
-        LOG_DBG("Takeoff detection: count=%d, rate=%.2f m/s",
-                executive_state.takeoff_confirm_count, climb_rate);
+        LOG_DBG("Takeoff detection: count=%d/%d, rate=%.2f m/s",
+                executive_state.takeoff_confirm_count,
+                3 * EXEC_TICKS_PER_SECOND, climb_rate);
 
         /* Require 3 consecutive seconds of climb (debounce) */
-        if (executive_state.takeoff_confirm_count >= 3) {
+        if (executive_state.takeoff_confirm_count >= (3 * EXEC_TICKS_PER_SECOND)) {
             LOG_INF("Executive: Takeoff detected! climb_rate=%.2f m/s (%.0f ft/min)",
                     climb_rate, climb_rate * 196.85f);
 
             /* Transition to LOGGING state */
             int ret = logger_start();
-            if (ret == 0) {
-                
-            } else {
+            if (ret != 0) {
                 LOG_ERR("Failed to start logging: %d", ret);
             }
         }
@@ -781,34 +803,66 @@ static void executive_handle_armed_state(float climb_rate)
 static void executive_handle_logging_state(float climb_rate)
 {
     bool is_low_activity = fabsf(climb_rate) < EXEC_LOW_ACTIVITY_RATE_MPS;
+    float accel_magnitude_g = 0.0f;
+    bool accel_valid = (imu_get_filtered_acceleration(&accel_magnitude_g) == 0);
 
-    /* DEBUG: Periodically log climb rate and low activity counter */
-    LOG_DBG("LOGGING: climb=%.2f m/s (%.0f ft/min), low_act=%s, counter=%u/%u",
-            climb_rate, climb_rate * 196.85f,
+    /* DEBUG: Log state periodically */
+    LOG_DBG("LOGGING: climb=%.2f m/s, accel=%.2fg, low_act=%s, counter=%u/%u",
+            climb_rate, accel_magnitude_g,
             is_low_activity ? "YES" : "NO",
-            executive_state.low_activity_counter_s,
-            EXEC_LOGGING_ABORT_TIMEOUT_S);
+            executive_state.low_activity_counter,
+            EXEC_LOGGING_ABORT_TIMEOUT_S * EXEC_TICKS_PER_SECOND);
 
-    /* Check for freefall (fast descent) */
+    /*
+     * Freefall detection - two methods:
+     * 1. Barometric: Fast descent rate (< -1000 ft/min) for 2 seconds
+     * 2. Accelerometer: Low-g (< 0.6g) for 2 consecutive readings (500ms)
+     *
+     * Accelerometer method is faster and more responsive for jump detection.
+     */
+
+    /* Method 1: Barometric freefall detection (fast descent) */
     if (climb_rate < EXEC_FREEFALL_DESCENT_RATE_MPS) {
         executive_state.freefall_confirm_count++;
 
         /* Require 2 consecutive seconds of fast descent (debounce) */
-        if (executive_state.freefall_confirm_count >= 2) {
-            LOG_INF("Executive: Freefall detected! climb_rate=%.2f m/s (%.0f ft/min)",
+        if (executive_state.freefall_confirm_count >= (2 * EXEC_TICKS_PER_SECOND)) {
+            LOG_INF("Executive: Freefall detected (baro)! climb_rate=%.2f m/s (%.0f ft/min)",
                     climb_rate, climb_rate * 196.85f);
 
             logger_jumped();
+            return;  /* State changed, exit early */
         }
     } else {
         executive_state.freefall_confirm_count = 0;
     }
 
+    /* Method 2: Accelerometer-based freefall detection (low-g) */
+    if (accel_valid && accel_magnitude_g < EXEC_FREEFALL_ACCEL_THRESHOLD_G) {
+        executive_state.low_accel_confirm_count++;
+
+        LOG_DBG("Low-g detected: %.2fg, count=%d/%d",
+                accel_magnitude_g,
+                executive_state.low_accel_confirm_count,
+                EXEC_FREEFALL_ACCEL_CONFIRM);
+
+        /* Require 2 consecutive readings below threshold (500ms at 250ms interval) */
+        if (executive_state.low_accel_confirm_count >= EXEC_FREEFALL_ACCEL_CONFIRM) {
+            LOG_INF("Executive: Freefall detected (accel)! magnitude=%.2fg",
+                    accel_magnitude_g);
+
+            logger_jumped();
+            return;  /* State changed, exit early */
+        }
+    } else {
+        executive_state.low_accel_confirm_count = 0;
+    }
+
     /* Check for abort condition (no jump - aircraft landed) */
     if (is_low_activity) {
-        executive_state.low_activity_counter_s++;
+        executive_state.low_activity_counter++;
 
-        if (executive_state.low_activity_counter_s >= EXEC_LOGGING_ABORT_TIMEOUT_S) {
+        if (executive_state.low_activity_counter >= (EXEC_LOGGING_ABORT_TIMEOUT_S * EXEC_TICKS_PER_SECOND)) {
             LOG_INF("Executive: Logging abort - no jump detected after %d seconds",
                     EXEC_LOGGING_ABORT_TIMEOUT_S);
 
@@ -825,7 +879,7 @@ static void executive_handle_logging_state(float climb_rate)
         }
     } else {
         /* Reset low activity counter on any significant movement */
-        executive_state.low_activity_counter_s = 0;
+        executive_state.low_activity_counter = 0;
     }
 }
 
@@ -836,13 +890,14 @@ static void executive_handle_jumped_state(float climb_rate)
 
     /* Check for landing (sustained low activity) */
     if (is_low_activity) {
-        executive_state.low_activity_counter_s++;
+        executive_state.low_activity_counter++;
 
-        LOG_DBG("JUMPED low activity: %d/%d seconds",
-                executive_state.low_activity_counter_s,
+        LOG_DBG("JUMPED low activity: %u/%d ticks (%d seconds)",
+                executive_state.low_activity_counter,
+                EXEC_JUMPED_TIMEOUT_S * EXEC_TICKS_PER_SECOND,
                 EXEC_JUMPED_TIMEOUT_S);
 
-        if (executive_state.low_activity_counter_s >= EXEC_JUMPED_TIMEOUT_S) {
+        if (executive_state.low_activity_counter >= (EXEC_JUMPED_TIMEOUT_S * EXEC_TICKS_PER_SECOND)) {
             LOG_INF("Executive: Landing detected after %d seconds of low activity",
                     EXEC_JUMPED_TIMEOUT_S);
 
@@ -859,11 +914,11 @@ static void executive_handle_jumped_state(float climb_rate)
         }
     } else {
         /* Reset counter - still in active descent */
-        executive_state.low_activity_counter_s = 0;
+        executive_state.low_activity_counter = 0;
     }
 }
 
-/* Main executive function - call every 1 second from main loop */
+/* Main executive function - call every 250ms from main loop */
 void logger_executive(void)
 {
     logger_state_t current_state;
