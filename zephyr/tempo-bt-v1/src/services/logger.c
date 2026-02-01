@@ -333,14 +333,19 @@ int logger_jumped(void)
     
     logger_state_t old_state = logger_state.state;
     logger_state.state = LOGGER_STATE_JUMPED;
-    
+
     k_mutex_unlock(&logger_state.lock);
 
     /*
-     * Transition to higher frequency position reporting
+     * Reset low-activity counter immediately on JUMPED transition.
+     * This must happen BEFORE gnss_set_rate() which now takes longer
+     * due to ACK waits, otherwise the executive may trigger landing
+     * detection using the stale counter from LOGGING state.
      */
-    gnss_set_rate(10);
     executive_reset_counters();
+
+    /* Transition to higher frequency position reporting */
+    gnss_set_rate(10);
 
     /* Log state change */
     aggregator_write_state_change(state_to_string(old_state),

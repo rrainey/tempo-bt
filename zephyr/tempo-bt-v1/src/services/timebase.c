@@ -40,6 +40,16 @@ static struct k_work_delayable pps_led_off_work;
 /* Work item for test alarm processing (called from PPS context) */
 static struct k_work test_alarm_work;
 
+/*
+ * Dedicated work queue for test alarm processing
+ * Uses larger stack (3KB) to handle FAT filesystem I/O in logger_start()
+ * The system work queue stack is too small for file operations
+ */
+#define TEST_ALARM_STACK_SIZE 3072
+#define TEST_ALARM_PRIORITY   5
+static K_THREAD_STACK_DEFINE(test_alarm_stack, TEST_ALARM_STACK_SIZE);
+static struct k_work_q test_alarm_workq;
+
 /* Flag indicating PPS system is initialized */
 static bool pps_initialized = false;
 
@@ -273,8 +283,8 @@ static void pps_gpio_callback(const struct device *dev, struct gpio_callback *cb
     /* Schedule LED off after 100ms */
     k_work_reschedule(&pps_led_off_work, K_MSEC(100));
 
-    /* Schedule test alarm check (runs in work queue context) */
-    k_work_submit(&test_alarm_work);
+    /* Schedule test alarm check (runs in dedicated work queue for larger stack) */
+    k_work_submit_to_queue(&test_alarm_workq, &test_alarm_work);
 }
 
 int timebase_pps_init(void)
@@ -333,6 +343,12 @@ int timebase_pps_init(void)
 
     /* Initialize delayed work for LED off */
     k_work_init_delayable(&pps_led_off_work, pps_led_off_handler);
+
+    /* Initialize dedicated work queue for test alarm (needs larger stack for FAT I/O) */
+    k_work_queue_init(&test_alarm_workq);
+    k_work_queue_start(&test_alarm_workq, test_alarm_stack,
+                       K_THREAD_STACK_SIZEOF(test_alarm_stack),
+                       TEST_ALARM_PRIORITY, NULL);
 
     /* Initialize test alarm work */
     k_work_init(&test_alarm_work, test_alarm_work_handler);

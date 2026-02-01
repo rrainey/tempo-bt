@@ -126,7 +126,7 @@ static uint64_t get_session_start_us(void);
 /* UART configuration */
 #define GNSS_UART_NODE DT_NODELABEL(uart2)
 #define GNSS_UART_BUFFER_SIZE 1024
-#define GNSS_RX_TIMEOUT_US 100000  /* 100ms timeout */
+#define GNSS_RX_TIMEOUT_US 10000   /* 10ms timeout - shorter for 10 Hz operation */
 
 /* UART device and buffers */
 static const struct device *uart_dev;
@@ -923,7 +923,7 @@ static void gnss_thread(void *p1, void *p2, void *p3)
 }
 
 K_THREAD_DEFINE(gnss_thread_id, 4096, gnss_thread, NULL, NULL, NULL,
-                7, 0, 0);
+                3, 0, 0);  /* Priority 3: high priority for UART processing at 10 Hz */
 
 /*
  * Early GNSS quiet function - call very early in boot sequence.
