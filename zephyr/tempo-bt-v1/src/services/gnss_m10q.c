@@ -125,7 +125,7 @@ static uint64_t get_session_start_us(void);
 
 /* UART configuration */
 #define GNSS_UART_NODE DT_NODELABEL(uart2)
-#define GNSS_UART_BUFFER_SIZE 256
+#define GNSS_UART_BUFFER_SIZE 1024
 #define GNSS_RX_TIMEOUT_US 100000  /* 100ms timeout */
 
 /* UART device and buffers */
@@ -1369,18 +1369,61 @@ int gnss_set_rate(uint8_t rate_hz)
     int ret;
     uint8_t ubx_cfg_rate[14];
     uint16_t period_ms;
-    
+
     /* SAM-M10Q supports 1Hz to 10Hz */
     if (rate_hz < 1 || rate_hz > 10) {
         LOG_ERR("Invalid rate %d Hz (SAM-M10Q supports 1-10 Hz)", rate_hz);
         return -EINVAL;
     }
-    
+
     /* Calculate period in milliseconds */
     period_ms = 1000 / rate_hz;
-    
+
     LOG_INF("Setting GNSS rate to %d Hz (period %d ms)", rate_hz, period_ms);
-    
+
+    /*
+     * At high rates (>1 Hz), disable GSA and RMC to reduce NMEA bandwidth.
+     * At 10 Hz, only GGA and VTG are needed for position/velocity logging.
+     * Re-enable GSA and RMC when returning to 1 Hz for full DOP and date info.
+     */
+    if (rate_hz > 1) {
+        /* Disable GSA (0xF0 0x02) - rate=0 for all ports */
+        static const uint8_t disable_gsa[] = {0xF0, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, disable_gsa, sizeof(disable_gsa));
+        if (ret < 0) {
+            LOG_WRN("Failed to disable GSA: %d", ret);
+        } else {
+            LOG_INF("GSA disabled for high-rate mode");
+        }
+
+        /* Disable RMC (0xF0 0x04) - rate=0 for all ports */
+        static const uint8_t disable_rmc[] = {0xF0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, disable_rmc, sizeof(disable_rmc));
+        if (ret < 0) {
+            LOG_WRN("Failed to disable RMC: %d", ret);
+        } else {
+            LOG_INF("RMC disabled for high-rate mode");
+        }
+    } else {
+        /* Re-enable GSA (0xF0 0x02) - rate=1 for UART1 */
+        static const uint8_t enable_gsa[] = {0xF0, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+        ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, enable_gsa, sizeof(enable_gsa));
+        if (ret < 0) {
+            LOG_WRN("Failed to enable GSA: %d", ret);
+        } else {
+            LOG_INF("GSA re-enabled for 1 Hz mode");
+        }
+
+        /* Re-enable RMC (0xF0 0x04) - rate=1 for UART1 */
+        static const uint8_t enable_rmc[] = {0xF0, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+        ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, enable_rmc, sizeof(enable_rmc));
+        if (ret < 0) {
+            LOG_WRN("Failed to enable RMC: %d", ret);
+        } else {
+            LOG_INF("RMC re-enabled for 1 Hz mode");
+        }
+    }
+
     /* Build UBX-CFG-RATE message */
     ubx_cfg_rate[0] = 0xB5;  /* Sync char 1 */
     ubx_cfg_rate[1] = 0x62;  /* Sync char 2 */
@@ -1394,7 +1437,7 @@ int gnss_set_rate(uint8_t rate_hz)
     ubx_cfg_rate[9] = 0x00;  /* navRate MSB */
     ubx_cfg_rate[10] = 0x01; /* timeRef LSB (1 = GPS time) */
     ubx_cfg_rate[11] = 0x00; /* timeRef MSB */
-    
+
     /* Calculate and add checksum */
     uint8_t ck_a = 0, ck_b = 0;
     for (int i = 2; i < 12; i++) {
@@ -1403,19 +1446,19 @@ int gnss_set_rate(uint8_t rate_hz)
     }
     ubx_cfg_rate[12] = ck_a;
     ubx_cfg_rate[13] = ck_b;
-    
+
     /* Send command */
     ret = uart_tx(uart_dev, ubx_cfg_rate, sizeof(ubx_cfg_rate), SYS_FOREVER_MS);
     if (ret < 0) {
         LOG_ERR("Failed to send rate config: %d", ret);
         return ret;
     }
-    
+
     /* TODO: Wait for UBX-ACK-ACK response to confirm */
     k_msleep(100);
-    
+
     LOG_INF("GNSS rate configuration sent");
-    
+
     return 0;
 }
 
