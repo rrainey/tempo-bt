@@ -1478,6 +1478,10 @@ static void update_system_time_from_fix(void)
         extern char gps_date_string[14];
         snprintf(gps_date_string, sizeof(gps_date_string),
                  "%04d-%02d-%02d", current_fix.year, current_fix.month, current_fix.day);
+
+        /* Update timebase correlation for UTC time queries (mcumgr GET_DATETIME, TEST_LOGGING) */
+        uint64_t utc_ms = (uint64_t)unix_time * 1000ULL + current_fix.milliseconds;
+        timebase_update_correlation(utc_ms, 100);  /* 100ms accuracy estimate */
     } else {
         LOG_ERR("Failed to set system time: %d", ret);
     }

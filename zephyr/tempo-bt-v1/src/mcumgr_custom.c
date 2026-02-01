@@ -797,8 +797,11 @@ static int tempo_mgmt_get_datetime(struct smp_streamer *ctxt)
     zcbor_state_t *zse = ctxt->writer->zs;
     char datetime_buf[32];
 
+    LOG_INF("Get datetime handler called");
+
     int ret = timebase_get_utc_iso8601(datetime_buf, sizeof(datetime_buf));
     if (ret != 0) {
+        LOG_WRN("No valid UTC time available (ret=%d)", ret);
         /* No valid UTC time available */
         bool ok = zcbor_tstr_put_lit(zse, "error") &&
                   zcbor_tstr_put_lit(zse, "No valid UTC time") &&
@@ -1010,5 +1013,6 @@ static struct mgmt_group tempo_mgmt_group = {
 void tempo_mgmt_register(void)
 {
     mgmt_register_group(&tempo_mgmt_group);
-    LOG_INF("Tempo custom mcumgr handlers registered");
+    LOG_INF("Tempo custom mcumgr handlers registered (group=%d, count=%d)",
+            MGMT_GROUP_ID_TEMPO, (int)ARRAY_SIZE(tempo_mgmt_handlers));
 }
