@@ -61,7 +61,7 @@ def main():
 #define APP_VERSION_STRING "{version}"
 #define APP_GIT_COMMIT "{git_commit}"
 #define APP_BUILD_DATE "{build_date}"
-#define APP_DEVICE_TYPE "V1"
+#define APP_DEVICE_TYPE "V2"
 #define APP_VERSION_MAJOR {version.split('.')[0]}
 #define APP_VERSION_MINOR {version.split('.')[1]}
 #define APP_VERSION_PATCH {version.split('.')[2]}
