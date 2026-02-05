@@ -16,6 +16,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "services/imu.h"
+
 /* Orientation quaternion structure */
 typedef struct {
     float w;
@@ -96,6 +98,16 @@ int orientation_get_quaternion(orientation_quaternion_t *quat);
  * @return 0 on success, negative error code on failure
  */
 int orientation_get_euler(orientation_euler_t *euler);
+
+/**
+ * @brief Get the most recent raw IMU sample
+ *
+ * Returns the latest accel/gyro sample processed by the orientation thread.
+ *
+ * @param sample Output IMU sample structure
+ * @return 0 on success, negative error code on failure
+ */
+int orientation_get_latest_imu(imu_sample_t *sample);
 
 /**
  * @brief Reset orientation to identity

@@ -31,7 +31,7 @@ static uint32_t last_nmea_arrival_ms = 0;
 #define GNSS_RING_SIZE      32   /* 32 fixes @ 10Hz = 3.2s buffer (increased for 10Hz) */
 
 /* Output timing */
-#define IMU_OUTPUT_PERIOD_MS    20   /* 50 Hz */
+#define IMU_OUTPUT_PERIOD_MS    50   /* 20 Hz */
 #define ENV_OUTPUT_PERIOD_MS    250  /* 4 Hz */
 
 char gps_date_string[14];
@@ -276,7 +276,20 @@ static void imu_output_handler(struct k_work *work)
     uint32_t timestamp_ms = log_get_timestamp_ms(config.session_start_us);
     int len;
 
-    /* Output quaternion (orientation service now owns IMU data) */
+    /* Output raw IMU data (accel + gyro) */
+    imu_sample_t imu;
+    if (orientation_get_latest_imu(&imu) == 0) {
+        len = log_format_sentence(line, sizeof(line),
+                                  "$PIMU,%u,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f",
+                                  timestamp_ms,
+                                  imu.accel_x, imu.accel_y, imu.accel_z,
+                                  imu.gyro_x, imu.gyro_y, imu.gyro_z);
+        if (len > 0) {
+            output_callback(line, len);
+        }
+    }
+
+    /* Output quaternion */
     if (config.enable_quaternion) {
         orientation_quaternion_t quat;
         if (orientation_get_quaternion(&quat) == 0) {
@@ -285,7 +298,6 @@ static void imu_output_handler(struct k_work *work)
                                       timestamp_ms,
                                       quat.w, quat.x, quat.y, quat.z);
         } else {
-            /* Fallback to identity quaternion if orientation not available */
             len = log_format_sentence(line, sizeof(line),
                                       "$PIM2,%u,1.0000,0.0000,0.0000,0.0000",
                                       timestamp_ms);

@@ -39,6 +39,7 @@ static struct {
     uint64_t last_sample_us;
     uint32_t sample_count;
     uint32_t poll_count;
+    imu_sample_t latest_imu;        /* Most recent raw IMU sample for $PIMU output */
     struct k_mutex lock;
 } state;
 
@@ -118,6 +119,7 @@ static void process_sample(const imu_sample_t *sample)
     FusionAhrsUpdateNoMagnetometer(&state.ahrs, gyroscope, accelerometer, delta_time);
 #endif
 
+    state.latest_imu = *sample;
     state.sample_count++;
 }
 
@@ -317,6 +319,23 @@ int orientation_get_euler(orientation_euler_t *euler)
     euler->pitch = fusion_euler.pitch;
     euler->yaw = fusion_euler.yaw;
 
+    k_mutex_unlock(&state.lock);
+
+    return 0;
+}
+
+int orientation_get_latest_imu(imu_sample_t *sample)
+{
+    if (!sample) {
+        return -EINVAL;
+    }
+
+    if (!state.initialized) {
+        return -ENODEV;
+    }
+
+    k_mutex_lock(&state.lock, K_FOREVER);
+    *sample = state.latest_imu;
     k_mutex_unlock(&state.lock);
 
     return 0;
