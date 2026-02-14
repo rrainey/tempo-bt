@@ -19,8 +19,11 @@
 
 LOG_MODULE_REGISTER(gnss, LOG_LEVEL_INF);
 
-static int ubx_send_with_ack(uint8_t msg_class, uint8_t msg_id, 
+static int ubx_send_with_ack(uint8_t msg_class, uint8_t msg_id,
                              const uint8_t *payload, size_t payload_len);
+static int ubx_send_with_retry(uint8_t msg_class, uint8_t msg_id,
+                               const uint8_t *payload, size_t payload_len,
+                               int max_retries);
 
 /* UBX Protocol definitions */
 #define UBX_SYNC1       0xB5
@@ -1389,7 +1392,7 @@ int gnss_set_rate(uint8_t rate_hz)
     if (rate_hz > 1) {
         /* Disable GSA (0xF0 0x02) - rate=0 for all ports */
         static const uint8_t disable_gsa[] = {0xF0, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-        ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, disable_gsa, sizeof(disable_gsa));
+        ret = ubx_send_with_retry(UBX_CLASS_CFG, UBX_ID_CFG_MSG, disable_gsa, sizeof(disable_gsa), 1);
         if (ret < 0) {
             LOG_WRN("Failed to disable GSA: %d", ret);
         } else {
@@ -1398,7 +1401,7 @@ int gnss_set_rate(uint8_t rate_hz)
 
         /* Disable RMC (0xF0 0x04) - rate=0 for all ports */
         static const uint8_t disable_rmc[] = {0xF0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-        ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, disable_rmc, sizeof(disable_rmc));
+        ret = ubx_send_with_retry(UBX_CLASS_CFG, UBX_ID_CFG_MSG, disable_rmc, sizeof(disable_rmc), 1);
         if (ret < 0) {
             LOG_WRN("Failed to disable RMC: %d", ret);
         } else {
@@ -1407,7 +1410,7 @@ int gnss_set_rate(uint8_t rate_hz)
     } else {
         /* Re-enable GSA (0xF0 0x02) - rate=1 for UART1 */
         static const uint8_t enable_gsa[] = {0xF0, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
-        ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, enable_gsa, sizeof(enable_gsa));
+        ret = ubx_send_with_retry(UBX_CLASS_CFG, UBX_ID_CFG_MSG, enable_gsa, sizeof(enable_gsa), 1);
         if (ret < 0) {
             LOG_WRN("Failed to enable GSA: %d", ret);
         } else {
@@ -1416,7 +1419,7 @@ int gnss_set_rate(uint8_t rate_hz)
 
         /* Re-enable RMC (0xF0 0x04) - rate=1 for UART1 */
         static const uint8_t enable_rmc[] = {0xF0, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
-        ret = ubx_send_with_ack(UBX_CLASS_CFG, UBX_ID_CFG_MSG, enable_rmc, sizeof(enable_rmc));
+        ret = ubx_send_with_retry(UBX_CLASS_CFG, UBX_ID_CFG_MSG, enable_rmc, sizeof(enable_rmc), 1);
         if (ret < 0) {
             LOG_WRN("Failed to enable RMC: %d", ret);
         } else {
@@ -1798,6 +1801,28 @@ static int ubx_send_with_ack(uint8_t msg_class, uint8_t msg_id,
     return 0;
 }
 
+/* Retry wrapper for ubx_send_with_ack */
+static int ubx_send_with_retry(uint8_t msg_class, uint8_t msg_id,
+                               const uint8_t *payload, size_t payload_len,
+                               int max_retries)
+{
+    int ret;
+
+    for (int attempt = 0; attempt <= max_retries; attempt++) {
+        ret = ubx_send_with_ack(msg_class, msg_id, payload, payload_len);
+        if (ret == 0) {
+            return 0;
+        }
+        if (attempt < max_retries) {
+            LOG_WRN("UBX command failed (attempt %d/%d), retrying...",
+                    attempt + 1, max_retries + 1);
+            k_msleep(50);
+        }
+    }
+
+    return ret;
+}
+
 /* Poll current NAV5 configuration */
 int gnss_get_nav5_config(gnss_dynmodel_t *dynmodel, uint8_t *fix_mode)
 {
@@ -1901,11 +1926,11 @@ int gnss_init_skydiving(void)
     
     LOG_INF("Configuring GNSS for skydiving");
     
-    /* Set dynamic model to Airborne 4g for skydiving */
+    /* Set dynamic model to Airborne 2g for skydiving */
     ret = gnss_set_dynmodel(GNSS_DYNMODEL_AIRBORNE_2G);
     if (ret < 0) {
         LOG_WRN("Failed to set airborne 2g model: %d", ret);
-        /* Try airborne 2g as fallback */
+        /* Try airborne 1g as fallback */
         ret = gnss_set_dynmodel(GNSS_DYNMODEL_AIRBORNE_1G);
         if (ret < 0) {
             LOG_ERR("Failed to set airborne 1g model: %d", ret);

@@ -212,6 +212,16 @@ static void nmea_passthrough_callback(const char *sentence, size_t len)
             log_sentence = true;
             emit_pth = false;  /* No PTH after VTG */
         }
+        /* Check for RMC - date/time/position/velocity (1 Hz only) */
+        else if (strncmp(sentence + 3, "RMC", 3) == 0) {
+            log_sentence = true;
+            emit_pth = false;  /* No PTH after RMC */
+        }
+        /* Check for TXT - error messages */
+        else if (strncmp(sentence + 3, "TXT", 3) == 0) {
+            log_sentence = true;
+            emit_pth = false;  /* No PTH after TXT */
+        }
         
         if (log_sentence) {
             /* Output the raw NMEA sentence as-is */
