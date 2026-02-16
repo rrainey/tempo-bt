@@ -15,12 +15,12 @@
 tempo-bt/
 ├─ CMakeLists.txt                # Zephyr app build entry
 ├─ prj.conf                      # Kconfig: features, stacks, logging, BLE, FS
-├─ Kconfig                       # (optional) app-specific config symbols
+├─ Kconfig                       # App-specific config symbols (USB_TTY_OUTPUT, etc.)
 ├─ west.yml                      # (optional) NCS/Zephyr manifest pinning
 │
 ├─ boards/
 │  └─ nrf5340dk_nrf5340/
-│     ├─ tempo_v1.overlay        # DeviceTree overlay: pins/buses/IRQs for V1
+│     ├─ tempo_v1.overlay        # DeviceTree overlay: pins/buses/IRQs/USB for V1
 │     └─ tempo_v1.conf           # Board-specific prj.conf deltas (if needed)
 │
 ├─ include/
@@ -37,6 +37,7 @@ tempo-bt/
 │  ├─ services/storage.h         # Storage abstraction (littlefs/FATFS)
 │  ├─ services/orientation.h     # AHRS/orientation tracking API
 │  ├─ services/led.h             # RGB LED service API
+│  ├─ services/usb_tty.h         # USB CDC-ACM TTY output API (ground test)
 │  │
 │  └─ fusion.h                   # Fusion AHRS algorithm headers
 │
@@ -58,6 +59,7 @@ tempo-bt/
 │  │  ├─ storage.c              # Storage abstraction layer
 │  │  ├─ storage_littlefs.c     # QSPI NOR backend (optional)
 │  │  ├─ storage_fatfs.c        # SD Card FAT/exFAT backend (primary)
+│  │  ├─ usb_tty.c              # USB CDC-ACM TTY output (conditional)
 │  │  └─ led.c                  # PWM-based RGB LED control
 │  │
 │  └─ util/
@@ -68,6 +70,9 @@ tempo-bt/
 │
 ├─ docs/
 │  └─ mvp-architecture.md        # This document
+│
+├─ tools/
+│  └─ patch_rmc.py               # Retroactively insert RMC into old log files
 │
 └─ scripts/
    └─ host_tools/verify_log.py   # PC-side log validator
@@ -81,7 +86,7 @@ tempo-bt/
 
 **Current implementation status:**
 - ✓ BMP390 barometer (working, 8Hz with takeoff detection)
-- ✓ GNSS SAM-M10Q (working, 1-10Hz dynamic, UBX config)
+- ✓ GNSS SAM-M10Q (working, 1-10Hz dynamic, UBX config, RMC passthrough)
 - ✓ SD Card storage (FAT/exFAT, primary storage)
 - ✓ Orientation tracking (Fusion AHRS algorithm)
 - ✓ RGB LED status (PWM-based, state indication)
@@ -89,6 +94,7 @@ tempo-bt/
 - ✓ BLE file transfer (mcumgr)
 - ✓ ICM42688 IMU (200Hz FIFO, filtered accel magnitude for freefall detection)
 - ✓ Flight phase detection (takeoff, freefall, landing)
+- ✓ USB CDC-ACM TTY output (ground testing via Button 1 / BTN2)
 - ✗ MMC5983MA magnetometer (not integrated)
 
 ```mermaid
@@ -103,6 +109,7 @@ flowchart TB
     Agg[Aggregator\nSentence builder\nRing buffers]
     Orient[Orientation\nFusion AHRS]
     Writer[File Writer\nRing buffer + thread]
+    UsbTty[USB TTY\nCDC-ACM output\nGround test mode]
     Tm[Timebase\n64-bit mono + RTC]
   end
 
@@ -125,6 +132,7 @@ flowchart TB
   Orient --> Agg
 
   Agg --> Writer --> Storage
+  Agg -.-> UsbTty -.-> USB[USB Host]
 ```
 
 ### 2.2 Concurrency model (threads & priorities)
@@ -139,9 +147,11 @@ flowchart TB
 **Communication primitives:**
 
 * **Ring buffer** (Zephyr `sys/ring_buffer.h`) in file_writer for async I/O
+* **Ring buffer** in USB TTY for interrupt-driven CDC-ACM TX (4KB)
 * **Spinlock-protected ring buffers** in aggregator for IMU/BARO/GNSS samples
 * **Event bus** (`k_fifo`/`k_msgq`) for state change notifications
 * **Mutexes** for thread-safe stats access and orientation state
+* **Work items** (`k_work`, `k_work_delayable`) for deferred ISR-to-thread actions (buttons, USB disconnect)
 
 ---
 
@@ -198,7 +208,7 @@ flowchart TB
 ### 4.2 `imu_icm42688`
 
 * Configures ODR (200 Hz), full-scale ranges; enables FIFO streaming
-* SPI bursts to read FIFO; polled by orientation service at 50 Hz (20ms)
+* SPI bursts to read FIFO; polled by orientation service at 20 Hz
 * **Filtered acceleration magnitude API** for freefall detection:
   * `imu_enable_accel_filter()` / `imu_disable_accel_filter()` - enable/disable filtering
   * `imu_get_filtered_acceleration()` - get EMA-filtered magnitude in g
@@ -216,10 +226,11 @@ flowchart TB
 
 * **UART async API** with ring buffer for received data
 * **Early quiet**: `gnss_early_quiet()` called at boot to silence module before full init
-* **NMEA parsing**: GGA, GLL, VTG sentences passed through to log
+* **NMEA parsing**: GGA, VTG, RMC sentences passed through to log
 * **UBX protocol**: Configuration commands (rate, dynamic model, message enable/disable)
+* **UBX retry**: `ubx_send_with_retry()` wrapper retries failed CFG-MSG commands (occasional ACK failures)
 * **Dynamic model**: Airborne 4g for skydiving operations
-* **Rate control**: 1 Hz default, configurable up to 10 Hz
+* **Rate control**: 1 Hz default, configurable up to 10 Hz; GSA and RMC disabled at rates > 1 Hz to reduce NMEA bandwidth, re-enabled at 1 Hz
 
 ### 4.5 `orientation` + `fusion`
 
@@ -235,12 +246,12 @@ flowchart TB
 * **Output sentences**:
   * `$PVER` - Version info at session start
   * `$PSFC` - Surface/ground altitude
-  * `$PIMU` - IMU data (50 Hz when IMU working)
+  * `$PIMU` - IMU data (20 Hz when IMU working)
   * `$PIM2` - Quaternion orientation (after each `$PIMU`)
   * `$PENV` - Environmental data (4 Hz) - pressure, altitude, battery
   * `$PTH` - Timestamp correlation (after GGA/GLL)
   * `$PST` - State change events
-  * Raw GNSS: `$GxGGA`, `$GxGLL`, `$GxVTG` passthrough
+  * Raw GNSS: `$GxGGA`, `$GxVTG`, `$GxRMC` passthrough
 * **Work-based output**: Delayable work items for timed sentence emission
 
 ### 4.7 `logger`
@@ -265,7 +276,14 @@ flowchart TB
   * Creates date-based directories using GPS date
   * UUID-based filenames
   * Writes header (PVER, PSFC) at session start
-* **Button control integration**: Armed/disarmed via long press, start/stop via short press
+* **USB ground test mode** (`logger_start_usb()`):
+  * Streams identical NMEA data over USB CDC-ACM instead of SD card
+  * Triggered by Button 1 / BTN2 long press when USB host is connected
+  * Registers `usb_tty_output_line` as aggregator output callback
+  * Registers disconnect callback to auto-stop on USB cable removal
+  * Sets `usb_mode` flag — suppresses executive auto-transitions (no flight phase detection)
+  * `logger_stop()` calls `usb_tty_close()` instead of file_writer cleanup when in USB mode
+* **Button control integration**: Armed/disarmed via Button 0 / BTN1 long press, start/stop via short press; USB logging via Button 1 / BTN2 long press
 
 ### 4.8 `file_writer`
 
@@ -331,6 +349,21 @@ Used for multi-device synchronized testing via GNSS PPS signal.
   * After `jump` seconds, triggers `logger_jumped()` for state transition
   * Logger executive handles session closure after landing detection
 
+### 4.12 `usb_tty` (conditional: `CONFIG_USB_TTY_OUTPUT`)
+
+* **USB CDC-ACM** virtual UART over the nRF5340's built-in USB peripheral
+* **Ground test mode**: streams the same NMEA sentence data that normally goes to SD card
+* **Interrupt-driven TX** with 4KB ring buffer for non-blocking writes
+* **Connection detection**: checks DTR line control first, falls back to USB configured state (many Windows terminals don't assert DTR)
+* **Disconnect detection**: polls DTR while open; also monitors USB stack status callback (`USB_DC_DISCONNECTED`/`USB_DC_SUSPEND`)
+* **Disconnect notification**: fires registered callback via `k_work` (not from ISR context) so logger can safely stop
+* **API**:
+  * `usb_tty_init()` — enables USB device stack, called once at boot
+  * `usb_tty_is_connected()` — checks if a USB host is present
+  * `usb_tty_open()` / `usb_tty_close()` — session lifecycle
+  * `usb_tty_output_line()` — matches `aggregator_output_callback_t` signature
+  * `usb_tty_register_disconnect_callback()` — DTR-drop / USB-disconnect notification
+
 ---
 
 ## 5) How Services Connect
@@ -345,6 +378,7 @@ sequenceDiagram
   participant Orient as Orientation
   participant WR as File Writer
   participant SD as SD Card
+  participant USB as USB TTY
 
   BARO->>AGG: push sample (ring buffer)
   GNSS->>AGG: NMEA passthrough + fix data
@@ -352,9 +386,14 @@ sequenceDiagram
   Orient->>AGG: quaternion
 
   AGG->>AGG: build $PENV/$PTH/GNSS sentences
-  AGG->>WR: output callback (NMEA line)
-  WR->>WR: ring buffer enqueue
-  WR->>SD: worker thread flush
+  alt SD card mode (normal)
+    AGG->>WR: output callback (NMEA line)
+    WR->>WR: ring buffer enqueue
+    WR->>SD: worker thread flush
+  else USB mode (ground test)
+    AGG->>USB: output callback (NMEA line)
+    USB->>USB: ring buffer + IRQ TX
+  end
 ```
 
 ### 5.2 Control plane (events & state)
@@ -376,15 +415,19 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> IDLE
-    IDLE --> ARMED: long-press Button 0
+    IDLE --> ARMED: long-press Button 0 / BTN1
     IDLE --> LOGGING: TEST_LOGGING alarm (auto-arms)
-    ARMED --> IDLE: long-press Button 0
+    IDLE --> LOGGING: long-press Button 1 / BTN2 (USB mode)
+    ARMED --> IDLE: long-press Button 0 / BTN1
     ARMED --> LOGGING: short-press or takeoff detected (3s climb)
     ARMED --> LOGGING: TEST_LOGGING alarm
+    ARMED --> LOGGING: long-press Button 1 / BTN2 (USB mode)
     LOGGING --> JUMPED: freefall detected (baro 2s or accel 500ms)
     LOGGING --> JUMPED: TEST_LOGGING jump timer
     LOGGING --> ARMED: 6 min low activity (abort)
-    LOGGING --> IDLE: short-press (manual stop)
+    LOGGING --> IDLE: short-press Button 0 / BTN1 (manual stop)
+    LOGGING --> IDLE: long-press Button 1 / BTN2 (stop USB)
+    LOGGING --> IDLE: USB host disconnect (USB mode only)
     LOGGING --> ERROR: storage/sensor error
     JUMPED --> ARMED: landing detected (60s low activity)
     JUMPED --> IDLE: short-press (manual stop)
@@ -392,9 +435,12 @@ stateDiagram-v2
 ```
 
 **Button Controls (main.c):**
-- **Button 0 long press** (2 seconds): Toggle IDLE ↔ ARMED
-- **Button 0 short press**: Start logging (when ARMED) or stop logging (when LOGGING/JUMPED)
-- **Button 1**: Reserved for future use
+
+> Note: Zephyr code uses 0-indexed names (`button0`, `button1`) while PCB silkscreen uses 1-indexed labels (`BTN1`, `BTN2`).
+
+- **Button 0 / BTN1 long press** (2 seconds): Toggle IDLE ↔ ARMED
+- **Button 0 / BTN1 short press**: Start logging (when ARMED) or stop logging (when LOGGING/JUMPED)
+- **Button 1 / BTN2 long press** (2 seconds): Start USB TTY logging (when IDLE or ARMED, requires USB host); stop logging (when LOGGING/JUMPED, works for both USB and SD modes)
 
 **Automatic Flight Phase Detection (executive function @ 250ms):**
 
@@ -426,14 +472,14 @@ Uses **NMEA-style** `$Pxxx` proprietary sentences with checksums.
 |----------|------|-------------|
 | `$PVER` | Once | Version info: `"Tempo V1 <version> (<git>)",<numeric>` |
 | `$PSFC` | Once | Surface/ground altitude in feet |
-| `$PIMU` | 50 Hz | Accel (m/s²) + gyro (rad/s) - when IMU working |
-| `$PIM2` | 50 Hz | Quaternion (w,x,y,z) - after each PIMU |
+| `$PIMU` | 20 Hz | Accel (m/s²) + gyro (rad/s) - when IMU working |
+| `$PIM2` | 20 Hz | Quaternion (w,x,y,z) - after each PIMU |
 | `$PENV` | 4 Hz | Pressure (hPa), altitude (ft), battery (V) |
 | `$PTH` | Per fix | Timestamp correlation (ms since session start) |
 | `$PST` | Events | State change: old_state, new_state, trigger |
-| `$GxGGA` | 1 Hz | GNSS fix (passthrough) |
-| `$GxGLL` | 1 Hz | GNSS position (passthrough) |
-| `$GxVTG` | 1 Hz | GNSS velocity (passthrough) |
+| `$GxGGA` | 1 Hz or 10 Hz| GNSS fix (passthrough) |
+| `$GxVTG` | 1 Hz or 10 Hz| GNSS velocity (passthrough) |
+| `$GxRMC` | 1 Hz or 10 Hz| GNSS date/time/position/velocity (passthrough, 1 Hz mode only) |
 
 ### Checksum Format
 
@@ -456,11 +502,11 @@ All sentences end with `*HH\r\n` where HH is XOR checksum of characters between 
 - ✓ SD Card storage (FAT/exFAT)
 - ✓ BLE file transfer (mcumgr)
 - ✓ BMP390 barometer (8 Hz, takeoff detection)
-- ✓ SAM-M10Q GNSS (1-10 Hz, UBX config, airborne 4g mode)
+- ✓ SAM-M10Q GNSS (1-10 Hz, UBX config, airborne 4g mode, RMC passthrough)
 - ✓ ICM42688 IMU (200 Hz FIFO, orientation tracking, filtered accel magnitude)
 - ✓ Orientation tracking (Fusion AHRS with IMU data)
 - ✓ Logger state machine (IDLE/ARMED/LOGGING/JUMPED/ERROR)
-- ✓ Button controls (short/long press)
+- ✓ Button controls (Button 0 / BTN1 short/long press; Button 1 / BTN2 long press for USB)
 - ✓ RGB LED status indication
 - ✓ Event bus for state notifications
 - ✓ Date-stamped log directories (GPS date)
@@ -468,6 +514,10 @@ All sentences end with `*HH\r\n` where HH is XOR checksum of characters between 
 - ✓ Custom mcumgr commands (session/storage/LED/logger/settings control)
 - ✓ PPS-synchronized test logging (multi-device synchronization)
 - ✓ UTC datetime query (ISO 8601 format)
+- ✓ **USB CDC-ACM TTY output** (ground test mode via Button 1 / BTN2):
+  - Streams NMEA data over USB serial instead of SD card
+  - Auto-stop on USB host disconnect or Button 1 / BTN2 long press
+  - Executive auto-transitions suppressed in USB mode
 - ✓ **Flight phase detection** (executive function @ 250ms):
   - Takeoff detection (barometric climb rate)
   - Freefall detection (dual: barometric descent + accelerometer low-g)
@@ -483,7 +533,7 @@ All sentences end with `*HH\r\n` where HH is XOR checksum of characters between 
 
 ```conf
 # Heap for dynamic allocations
-CONFIG_HEAP_MEM_POOL_SIZE=32768
+CONFIG_HEAP_MEM_POOL_SIZE=16384
 
 # BLE with dynamic device name
 CONFIG_BT_DEVICE_NAME_DYNAMIC=y
@@ -494,25 +544,17 @@ CONFIG_FILE_SYSTEM=y
 CONFIG_FAT_FILESYSTEM_ELM=y
 CONFIG_DISK_ACCESS=y
 
-# UART async for GNSS
+# UART: async for GNSS, interrupt-driven for CDC-ACM
 CONFIG_UART_ASYNC_API=y
+CONFIG_UART_INTERRUPT_DRIVEN=y
+# Per-instance override: keep hardware UARTs on async API
+CONFIG_UART_0_INTERRUPT_DRIVEN=n
+CONFIG_UART_2_INTERRUPT_DRIVEN=n
+
+# USB CDC-ACM for ground test output
+CONFIG_USB_DEVICE_STACK=y
+CONFIG_USB_CDC_ACM=y
+CONFIG_USB_DEVICE_VID=0x1209
+CONFIG_USB_DEVICE_PID=0x2026
+CONFIG_USB_DEVICE_PRODUCT="Tempo-BT"
 ```
-
----
-
-## TL;DR
-
-* **Logger service** owns system state (IDLE → ARMED → LOGGING → JUMPED)
-* **Executive function** (250ms) handles automatic flight phase detection:
-  - Takeoff: 3s sustained climb > 200 ft/min
-  - Freefall: Baro descent < -1000 ft/min (2s) OR accel < 0.6g (500ms)
-  - Landing: 60s low activity after jump
-* **IMU service** provides 200Hz accel/gyro + filtered acceleration magnitude for freefall
-* **Aggregator** builds NMEA sentences from sensor ring buffers
-* **File writer** uses Zephyr ring buffer + worker thread for async I/O
-* **GNSS** provides position + time; PPS signal enables precise timing; 10Hz during freefall
-* **Barometer** provides altitude + climb rate via alpha-beta filter
-* **Orientation** uses Fusion AHRS for quaternion output from IMU
-* **Button 0** controls arming (long) and start/stop (short)
-* **LED** indicates state via color (blue=idle, orange=armed, green=logging, red=error)
-* **mcumgr** provides BLE commands for session management, settings, and synchronized test logging
