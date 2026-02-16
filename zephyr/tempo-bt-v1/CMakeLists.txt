@@ -68,6 +68,11 @@ target_include_directories_ifdef(CONFIG_MMC5983MA app PRIVATE
     drivers/sensor/mmc5983ma
 )
 
+# USB CDC-ACM TTY service (optional)
+target_sources_ifdef(CONFIG_USB_TTY_OUTPUT app PRIVATE
+    src/services/usb_tty.c
+)
+
 # Utility sources
 target_sources(app PRIVATE
     src/util/nmea_checksum.c

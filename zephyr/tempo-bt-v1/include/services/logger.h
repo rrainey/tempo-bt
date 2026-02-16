@@ -58,6 +58,18 @@ int logger_init(const logger_config_t *config);
  */
 int logger_start(void);
 
+#ifdef CONFIG_USB_TTY_OUTPUT
+/**
+ * @brief Start a USB TTY logging session (ground test mode)
+ *
+ * Streams sensor/NMEA data over USB CDC-ACM instead of SD card.
+ * Requires a USB host to be connected (DTR asserted).
+ *
+ * @return 0 on success, -ENOTCONN if no USB host, negative error otherwise
+ */
+int logger_start_usb(void);
+#endif
+
 /**
  * @brief Switch from LOGGING to JUMPED state
  * 

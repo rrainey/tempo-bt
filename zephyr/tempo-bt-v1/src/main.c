@@ -28,6 +28,9 @@
 #include "services/aggregator.h"
 #include "services/orientation.h"
 #include "util/nmea_checksum.h"
+#ifdef CONFIG_USB_TTY_OUTPUT
+#include "services/usb_tty.h"
+#endif
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -64,6 +67,9 @@ static bool button0_pending_start;  /* true = start, false = stop */
 #if DT_NODE_HAS_STATUS(SW1_NODE, okay)
 static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(SW1_NODE, gpios);
 static struct gpio_callback button1_cb_data;
+static struct k_work_delayable button1_work;
+static struct k_work button1_action_work;
+static int64_t button1_press_time;
 #endif
 
 /* Forward declaration for LED state update */
@@ -144,20 +150,65 @@ static void button0_released(const struct device *dev, struct gpio_callback *cb,
 }
 
 #if DT_NODE_HAS_STATUS(SW1_NODE, okay)
-static void button1_pressed(const struct device *dev, struct gpio_callback *cb,
-                            uint32_t pins)
+/* Button 1 long press detection — mirrors button 0 pattern */
+static void button1_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    int val = gpio_pin_get_dt(&button1);
+    if (val == 1) {
+        int64_t press_duration = k_uptime_get() - button1_press_time;
+
+        if (press_duration >= BUTTON_LONG_PRESS_MS) {
+            LOG_INF("Button 1 long press detected");
+            k_work_submit(&button1_action_work);
+        }
+    }
+}
+
+/* Button 1 action — runs outside ISR context */
+static void button1_action_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+#ifdef CONFIG_USB_TTY_OUTPUT
+    logger_state_t state = logger_get_state();
+
+    if (state == LOGGER_STATE_LOGGING || state == LOGGER_STATE_JUMPED) {
+        /* Stop current session (works for both USB and SD modes) */
+        logger_stop();
+        update_led_for_state(logger_get_state());
+    } else if (state == LOGGER_STATE_IDLE || state == LOGGER_STATE_ARMED) {
+        int ret = logger_start_usb();
+        if (ret == -ENOTCONN) {
+            LOG_INF("BTN1: no USB host connected, ignoring");
+        } else if (ret == 0) {
+            update_led_for_state(logger_get_state());
+        } else {
+            LOG_WRN("BTN1: USB logging start failed: %d", ret);
+        }
+    }
+#else
+    LOG_INF("Button 1 pressed (USB TTY not enabled)");
+#endif
+}
+
+static void button1_isr(const struct device *dev, struct gpio_callback *cb,
+                        uint32_t pins)
 {
     ARG_UNUSED(dev);
     ARG_UNUSED(cb);
     ARG_UNUSED(pins);
-    
-    LOG_INF("Button 1 pressed");
-    
-    /* Button 1 could be used for other functions like:
-     * - Force flush
-     * - Mark waypoint
-     * - Switch logging mode
-     */
+
+    int val = gpio_pin_get_dt(&button1);
+    if (val == 1) {
+        /* Pressed */
+        button1_press_time = k_uptime_get();
+        k_work_reschedule(&button1_work, K_MSEC(BUTTON_LONG_PRESS_MS));
+    } else {
+        /* Released — cancel long press detection */
+        k_work_cancel_delayable(&button1_work);
+    }
 }
 #endif
 
@@ -221,13 +272,16 @@ int buttons_init(void)
         return ret;
     }
     
-    ret = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_TO_ACTIVE);
+    ret = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_BOTH);
     if (ret != 0) {
         LOG_ERR("Failed to configure button 1 interrupt: %d", ret);
         return ret;
     }
-    
-    gpio_init_callback(&button1_cb_data, button1_pressed, BIT(button1.pin));
+
+    k_work_init_delayable(&button1_work, button1_work_handler);
+    k_work_init(&button1_action_work, button1_action_handler);
+
+    gpio_init_callback(&button1_cb_data, button1_isr, BIT(button1.pin));
     gpio_add_callback(button1.port, &button1_cb_data);
     
 #endif
@@ -392,7 +446,16 @@ int main(void)
     ret = buttons_init();
     if (ret < 0) {
         LOG_ERR("Failed to initialize buttons: %d", ret);
-    }   
+    }
+
+#ifdef CONFIG_USB_TTY_OUTPUT
+    /* Initialize USB early so host can enumerate during slow SD card init */
+    ret = usb_tty_init();
+    if (ret < 0) {
+        LOG_ERR("USB TTY init failed: %d", ret);
+        /* Non-critical — continue without USB TTY capability */
+    }
+#endif
 
     // Initialize storage first
     ret = app_storage_init(); 

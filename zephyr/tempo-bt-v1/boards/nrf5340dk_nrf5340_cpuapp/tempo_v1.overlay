@@ -238,6 +238,16 @@
 
 };
 
+/* USB Device — D+/D- on dedicated SoC pins (B106 C9/D9) */
+&usbd {
+    compatible = "nordic,nrf-usbd";
+    status = "okay";
+
+    cdc_acm_uart0: cdc_acm_uart0 {
+        compatible = "zephyr,cdc-acm-uart";
+    };
+};
+
 /* APP_NORA UART */
 &uart0 {
     status = "okay";

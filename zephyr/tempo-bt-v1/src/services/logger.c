@@ -21,6 +21,9 @@
 #include "services/gnss.h"
 #include "services/imu.h"
 #include "app/events.h"
+#ifdef CONFIG_USB_TTY_OUTPUT
+#include "services/usb_tty.h"
+#endif
 
 LOG_MODULE_REGISTER(logger, LOG_LEVEL_INF);
 
@@ -75,6 +78,9 @@ static struct {
     uint64_t session_start_us;
     char session_path[256];
     char log_file_path[256];
+
+    /* USB TTY output mode (ground testing) */
+    bool usb_mode;
 
     /* Synchronization */
     struct k_mutex lock;
@@ -318,6 +324,104 @@ int logger_start(void)
     return 0;
 }
 
+#ifdef CONFIG_USB_TTY_OUTPUT
+static void usb_disconnect_handler(void)
+{
+    LOG_INF("USB host disconnected, stopping USB logging");
+    logger_stop();
+}
+
+int logger_start_usb(void)
+{
+    int ret;
+
+    k_mutex_lock(&logger_state.lock, K_FOREVER);
+
+    if (logger_state.state != LOGGER_STATE_IDLE &&
+        logger_state.state != LOGGER_STATE_ARMED) {
+        LOG_WRN("Cannot start USB logging from state %s",
+                state_to_string(logger_state.state));
+        k_mutex_unlock(&logger_state.lock);
+        return -EINVAL;
+    }
+
+    /* Check USB host is connected */
+    if (!usb_tty_is_connected()) {
+        LOG_INF("No USB host connected");
+        k_mutex_unlock(&logger_state.lock);
+        return -ENOTCONN;
+    }
+
+    LOG_INF("Starting USB TTY logging session");
+
+    /* Generate session ID and timestamp */
+    logger_state.session_id = sys_rand32_get();
+    logger_state.session_start_us = time_now_us();
+    logger_state.usb_mode = true;
+
+    /* Open USB TTY */
+    ret = usb_tty_open();
+    if (ret != 0) {
+        LOG_ERR("Failed to open USB TTY: %d", ret);
+        logger_state.usb_mode = false;
+        k_mutex_unlock(&logger_state.lock);
+        return ret;
+    }
+
+    /* Register disconnect callback */
+    usb_tty_register_disconnect_callback(usb_disconnect_handler);
+
+    /* Configure aggregator — same as SD card logging */
+    aggregator_config_t agg_config = {
+        .imu_output_rate = logger_state.config.imu_rate_hz,
+        .env_output_rate = logger_state.config.env_rate_hz,
+        .gnss_output_rate = logger_state.config.gnss_rate_hz,
+        .mag_output_rate = logger_state.config.enable_magnetometer ? 10 : 0,
+        .enable_quaternion = logger_state.config.enable_quaternion,
+        .enable_magnetometer = logger_state.config.enable_magnetometer,
+        .session_id = logger_state.session_id,
+        .session_start_us = logger_state.session_start_us
+    };
+
+    aggregator_configure(&agg_config);
+    aggregator_register_output_callback(usb_tty_output_line);
+
+    /* Stop ground altitude sampling */
+    stop_ground_altitude_sampling();
+
+    /* Write session header */
+    aggregator_write_session_header();
+
+    /* Start aggregator */
+    ret = aggregator_start();
+    if (ret != 0) {
+        LOG_ERR("Failed to start aggregator: %d", ret);
+        usb_tty_close();
+        logger_state.usb_mode = false;
+        k_mutex_unlock(&logger_state.lock);
+        return ret;
+    }
+
+    /* Update state and emit event */
+    logger_state_t old_state = logger_state.state;
+    logger_state.state = LOGGER_STATE_LOGGING;
+
+    k_mutex_unlock(&logger_state.lock);
+
+    /* Write state change to log */
+    aggregator_write_state_change(state_to_string(old_state),
+                                  state_to_string(LOGGER_STATE_LOGGING),
+                                  "usb_start");
+
+    /* GNSS stays at 1 Hz */
+    gnss_set_rate(1);
+
+    LOG_INF("USB logging started: session=%08x", logger_state.session_id);
+
+    return 0;
+}
+#endif /* CONFIG_USB_TTY_OUTPUT */
+
 int logger_jumped(void)
 {
     k_mutex_lock(&logger_state.lock, K_FOREVER);
@@ -392,17 +496,27 @@ int logger_stop(void)
     
     /* Stop aggregator */
     aggregator_stop();
-    
-    /* Get final statistics */
-    file_writer_stats_t stats;
-    file_writer_get_stats(&stats);
-    
-    /* Close file */
-    file_writer_close();
-    
-    /* Log session summary */
-    LOG_INF("Session complete: %llu bytes, %u lines, %u errors",
-            stats.bytes_written, stats.lines_written, stats.write_errors);
+
+#ifdef CONFIG_USB_TTY_OUTPUT
+    if (logger_state.usb_mode) {
+        usb_tty_close();
+        usb_tty_register_disconnect_callback(NULL);
+        logger_state.usb_mode = false;
+        LOG_INF("USB logging session complete");
+    } else
+#endif
+    {
+        /* Get final statistics */
+        file_writer_stats_t stats;
+        file_writer_get_stats(&stats);
+
+        /* Close file */
+        file_writer_close();
+
+        /* Log session summary */
+        LOG_INF("Session complete: %llu bytes, %u lines, %u errors",
+                stats.bytes_written, stats.lines_written, stats.write_errors);
+    }
     
     /* Emit event */
     app_event_t evt = {
@@ -929,6 +1043,11 @@ void logger_executive(void)
     logger_state_t current_state;
     float climb_rate;
     bool rate_valid;
+
+    /* USB logging is a ground test mode — skip auto-transitions */
+    if (logger_state.usb_mode) {
+        return;
+    }
 
     /* Get current state under lock */
     k_mutex_lock(&logger_state.lock, K_FOREVER);

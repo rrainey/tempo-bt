@@ -28,6 +28,14 @@ config USE_MAG_IN_ORIENTATION
 	  gyroscope and accelerometer data. Heading will drift over time
 	  but is immune to magnetic interference.
 
+config USB_TTY_OUTPUT
+	bool "Enable USB CDC-ACM TTY output for ground testing"
+	default y
+	depends on USB_DEVICE_STACK && USB_CDC_ACM
+	help
+	  Long press BTN1 to stream sensor/NMEA data over USB serial
+	  when a USB host is connected. Ground test mode only.
+
 endmenu
 
 # Include project-specific drivers
