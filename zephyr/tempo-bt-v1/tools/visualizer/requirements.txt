@@ -1,0 +1,4 @@
+pyglet<2
+PyQt5
+pyserial
+pywavefront
