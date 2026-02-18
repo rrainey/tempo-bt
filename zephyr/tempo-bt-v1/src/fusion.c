@@ -92,12 +92,12 @@ void FusionAhrsUpdateNoMagnetometer(FusionAhrs *const ahrs, const FusionVector g
     
     if ((accelerometer.x != 0.0f) || (accelerometer.y != 0.0f) || (accelerometer.z != 0.0f)) {
         
-        // Calculate direction of gravity assumed by quaternion
+        // Calculate direction of gravity assumed by quaternion (NED convention)
         const FusionQuaternion q = ahrs->quaternion;
         halfGravity = (FusionVector) {
-            .x = q.x * q.z - q.w * q.y,
-            .y = q.w * q.x + q.y * q.z,
-            .z = q.w * q.w - 0.5f + q.z * q.z,
+            .x = q.w * q.y - q.x * q.z,
+            .y = -(q.y * q.z + q.w * q.x),
+            .z = 0.5f - q.w * q.w - q.z * q.z,
         };
         
         // Calculate accelerometer feedback

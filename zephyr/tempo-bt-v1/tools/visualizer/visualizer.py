@@ -82,7 +82,7 @@ class OpenGLWidget(QtOpenGL.QGLWidget):
     def __init__(self, parent=None):
         super(OpenGLWidget, self).__init__(parent)
         self.orientation = np.identity(4)
-        self.viewpoint = (20, 0, 0)
+        self.viewpoint = (-20,0,-20)
         self.up = (0, 0, -1)
         self.accel = (0.0, 0.0, 0.0)
         self.gyro = (0.0, 0.0, 0.0)
