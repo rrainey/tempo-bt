@@ -13,7 +13,7 @@
 
 #include "services/orientation.h"
 #include "services/imu.h"
-#include "fusion.h"
+#include "Fusion.h"
 
 #if CONFIG_USE_MAG_IN_ORIENTATION
 #include "services/mag.h"
@@ -88,15 +88,19 @@ static void process_sample(const imu_sample_t *sample)
      * - Accelerometer: m/s² to g
      */
     FusionVector gyroscope = {
-        .x = sample->gyro_x * (180.0f / (float)M_PI),
-        .y = sample->gyro_y * (180.0f / (float)M_PI),
-        .z = sample->gyro_z * (180.0f / (float)M_PI)
+        .axis = {
+            .x = sample->gyro_x * (180.0f / (float)M_PI),
+            .y = sample->gyro_y * (180.0f / (float)M_PI),
+            .z = sample->gyro_z * (180.0f / (float)M_PI)
+        }
     };
 
     FusionVector accelerometer = {
-        .x = sample->accel_x / 9.80665f,
-        .y = sample->accel_y / 9.80665f,
-        .z = sample->accel_z / 9.80665f
+        .axis = {
+            .x = sample->accel_x / 9.80665f,
+            .y = sample->accel_y / 9.80665f,
+            .z = sample->accel_z / 9.80665f
+        }
     };
 
     /* Update AHRS algorithm */
@@ -168,7 +172,7 @@ static void orientation_thread_fn(void *p1, void *p2, void *p3)
             orientation_get_quaternion(&quat);
             orientation_get_euler(&euler);
 
-            if (FusionAhrsIsInitialising(&state.ahrs)) {
+            if (FusionAhrsGetFlags(&state.ahrs).initialising) {
                 LOG_INF("AHRS initializing... samples=%u", state.sample_count);
             } else {
                 LOG_DBG("Orientation: RPY=[%.1f,%.1f,%.1f] samples=%u",
@@ -210,10 +214,12 @@ int orientation_init(const orientation_config_t *config)
 
     /* Configure AHRS settings */
     FusionAhrsSettings ahrs_settings = {
+        .convention = FusionConventionNed,  /* North-East-Down (aviation standard) */
         .gain = state.config.gain,
+        .gyroscopeRange = 2000.0f,  /* ICM-42688 configured to ±2000 dps */
         .accelerationRejection = state.config.acceleration_rejection,
         .magneticRejection = state.config.magnetic_rejection,
-        .rejectionTimeout = state.config.recovery_trigger_period
+        .recoveryTriggerPeriod = (unsigned int)state.config.recovery_trigger_period
     };
 
     FusionAhrsSetSettings(&state.ahrs, &ahrs_settings);
@@ -291,10 +297,10 @@ int orientation_get_quaternion(orientation_quaternion_t *quat)
 
     FusionQuaternion fusion_quat = FusionAhrsGetQuaternion(&state.ahrs);
 
-    quat->w = fusion_quat.w;
-    quat->x = fusion_quat.x;
-    quat->y = fusion_quat.y;
-    quat->z = fusion_quat.z;
+    quat->w = fusion_quat.element.w;
+    quat->x = fusion_quat.element.x;
+    quat->y = fusion_quat.element.y;
+    quat->z = fusion_quat.element.z;
 
     k_mutex_unlock(&state.lock);
 
@@ -313,11 +319,12 @@ int orientation_get_euler(orientation_euler_t *euler)
 
     k_mutex_lock(&state.lock, K_FOREVER);
 
-    FusionEuler fusion_euler = FusionAhrsGetEuler(&state.ahrs);
+    FusionQuaternion fusion_quat = FusionAhrsGetQuaternion(&state.ahrs);
+    FusionEuler fusion_euler = FusionQuaternionToEuler(fusion_quat);
 
-    euler->roll = fusion_euler.roll;
-    euler->pitch = fusion_euler.pitch;
-    euler->yaw = fusion_euler.yaw;
+    euler->roll = fusion_euler.angle.roll;
+    euler->pitch = fusion_euler.angle.pitch;
+    euler->yaw = fusion_euler.angle.yaw;
 
     k_mutex_unlock(&state.lock);
 
@@ -350,8 +357,7 @@ int orientation_reset(void)
     k_mutex_lock(&state.lock, K_FOREVER);
 
     /* Reset to identity quaternion */
-    FusionQuaternion identity = {1.0f, 0.0f, 0.0f, 0.0f};
-    FusionAhrsSetQuaternion(&state.ahrs, identity);
+    FusionAhrsSetQuaternion(&state.ahrs, FUSION_QUATERNION_IDENTITY);
 
     /* Reset timing */
     state.last_sample_us = 0;
@@ -372,23 +378,25 @@ int orientation_set_heading(float heading_deg)
     k_mutex_lock(&state.lock, K_FOREVER);
 
     /* Get current orientation */
-    FusionEuler current_euler = FusionAhrsGetEuler(&state.ahrs);
+    FusionQuaternion current_quat = FusionAhrsGetQuaternion(&state.ahrs);
+    FusionEuler current_euler = FusionQuaternionToEuler(current_quat);
 
     /* Calculate heading offset */
-    float heading_offset = heading_deg - current_euler.yaw;
+    float heading_offset = heading_deg - current_euler.angle.yaw;
 
     /* Create rotation quaternion for heading adjustment */
     float half_angle = FusionDegreesToRadians(heading_offset) * 0.5f;
     FusionQuaternion heading_rotation = {
-        .w = cosf(half_angle),
-        .x = 0.0f,
-        .y = 0.0f,
-        .z = sinf(half_angle)
+        .element = {
+            .w = cosf(half_angle),
+            .x = 0.0f,
+            .y = 0.0f,
+            .z = sinf(half_angle)
+        }
     };
 
     /* Apply heading rotation */
-    FusionQuaternion current_quat = FusionAhrsGetQuaternion(&state.ahrs);
-    FusionQuaternion adjusted_quat = FusionQuaternionMultiply(heading_rotation, current_quat);
+    FusionQuaternion adjusted_quat = FusionQuaternionProduct(heading_rotation, current_quat);
     FusionAhrsSetQuaternion(&state.ahrs, adjusted_quat);
 
     k_mutex_unlock(&state.lock);
@@ -427,10 +435,12 @@ int orientation_set_config(const orientation_config_t *config)
 
     /* Update AHRS settings */
     FusionAhrsSettings ahrs_settings = {
+        .convention = FusionConventionNed,  /* North-East-Down (aviation standard) */
         .gain = config->gain,
+        .gyroscopeRange = 2000.0f,  /* ICM-42688 configured to ±2000 dps */
         .accelerationRejection = config->acceleration_rejection,
         .magneticRejection = config->magnetic_rejection,
-        .rejectionTimeout = config->recovery_trigger_period
+        .recoveryTriggerPeriod = (unsigned int)config->recovery_trigger_period
     };
 
     FusionAhrsSetSettings(&state.ahrs, &ahrs_settings);
@@ -448,7 +458,7 @@ bool orientation_is_ready(void)
         return false;
     }
 
-    return !FusionAhrsIsInitialising(&state.ahrs);
+    return !FusionAhrsGetFlags(&state.ahrs).initialising;
 }
 
 uint32_t orientation_get_sample_count(void)

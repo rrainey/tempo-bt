@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "fusion.h"
+#include "Fusion.h"
 
 /**
  * @brief Magnetometer sample data

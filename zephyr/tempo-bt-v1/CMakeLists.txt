@@ -76,10 +76,19 @@ target_sources_ifdef(CONFIG_USB_TTY_OUTPUT app PRIVATE
 # Utility sources
 target_sources(app PRIVATE
     src/util/nmea_checksum.c
-    src/fusion.c
     tests/test_imu.c
+)
+
+# Fusion AHRS library
+target_sources(app PRIVATE
+    Fusion/FusionAhrs.c
+    Fusion/FusionBias.c
+    Fusion/FusionCompass.c
 )
 
 # NORDIC SDK APP END
 zephyr_library_include_directories(.)
-target_include_directories(app PRIVATE include)
+target_include_directories(app PRIVATE
+    include
+    ${CMAKE_CURRENT_SOURCE_DIR}/Fusion
+)

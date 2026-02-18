@@ -206,6 +206,28 @@ Connect via RTT to see debug messages:
 JLinkRTTViewer
 ```
 
+## Acknowledgments
+
+This project incorporates the following open-source libraries:
+
+### Fusion AHRS Algorithm
+
+The orientation tracking system uses the **Fusion** sensor fusion library by [xioTechnologies](https://x-io.co.uk/):
+
+- **Project**: Fusion - Sensor Fusion Library for Inertial Measurement Units (IMUs)
+- **Author**: Seb Madgwick
+- **Repository**: https://github.com/xioTechnologies/Fusion
+- **License**: MIT License
+- **Usage**: Provides AHRS (Attitude and Heading Reference System) quaternion estimation from gyroscope and accelerometer data
+
+The Fusion library implements a complementary filter with adaptive gain, gyroscope bias correction, and rejection of acceleration disturbances. It is specifically optimized for embedded systems.
+
+**Citation**:
+```
+Madgwick, S. (2021). Fusion - Sensor Fusion Library for IMUs [Software].
+Available from https://github.com/xioTechnologies/Fusion
+```
+
 ## License
 
 This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.

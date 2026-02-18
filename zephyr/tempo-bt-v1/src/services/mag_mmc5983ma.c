@@ -346,9 +346,9 @@ int mag_read_fusion(FusionVector *vec)
     }
 
     /* Return normalized vector for AHRS */
-    vec->x = sample.norm_x;
-    vec->y = sample.norm_y;
-    vec->z = sample.norm_z;
+    vec->axis.x = sample.norm_x;
+    vec->axis.y = sample.norm_y;
+    vec->axis.z = sample.norm_z;
 
     return 0;
 }
