@@ -82,7 +82,7 @@ class OpenGLWidget(QtOpenGL.QGLWidget):
     def __init__(self, parent=None):
         super(OpenGLWidget, self).__init__(parent)
         self.orientation = np.identity(4)
-        self.viewpoint = (-20,0,-20)
+        self.viewpoint = (-20,-20,-20)
         self.up = (0, 0, -1)
         self.accel = (0.0, 0.0, 0.0)
         self.gyro = (0.0, 0.0, 0.0)
@@ -170,15 +170,18 @@ class OpenGLWidget(QtOpenGL.QGLWidget):
         """Update displayed IMU telemetry values."""
         self.accel = (ax, ay, az)
         self.gyro = (gx, gy, gz)
+        gx *= 57.3
+        gy *= 57.3
+        gz *= 57.3
         self.telemetry_label.setText(
             f"Accel (m/s\u00b2)\n"
             f"  X: {ax:+8.2f}\n"
             f"  Y: {ay:+8.2f}\n"
             f"  Z: {az:+8.2f}\n"
-            f"Gyro (rad/s)\n"
-            f"  X: {gx:+8.4f}\n"
-            f"  Y: {gy:+8.4f}\n"
-            f"  Z: {gz:+8.4f}"
+            f"Gyro (deg/s)\n"
+            f"  X: {gx:+8.3f}\n"
+            f"  Y: {gy:+8.3f}\n"
+            f"  Z: {gz:+8.3f}"
         )
         self.update()
 
@@ -241,8 +244,8 @@ class Window(QtWidgets.QMainWindow):
             # $PIM2,<timestamp_ms>,<qw>,<qx>,<qy>,<qz>*HH
             try:
                 qw = float(fields[2])
-                qx = float(fields[3])
-                qy = float(fields[4])
+                qx = -float(fields[3])  # Negate X
+                qy = -float(fields[4])  # Negate Y
                 qz = float(fields[5])
                 self.opengl_widget.update_orientation(qw, qx, qy, qz)
             except (ValueError, IndexError):
