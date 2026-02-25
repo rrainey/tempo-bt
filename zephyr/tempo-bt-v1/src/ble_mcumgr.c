@@ -27,6 +27,12 @@ LOG_MODULE_REGISTER(ble_mcumgr, LOG_LEVEL_INF);
 
 static struct k_work advertising_work;
 
+/* Deferred BLE stop work item (500 ms delay) */
+static struct k_work_delayable ble_stop_work;
+
+/* Track whether BLE radio is currently active */
+static bool ble_radio_active;
+
 /* Storage for dynamic device name */
 static char device_name[32] = "Tempo-BT";  /* Default fallback */
 
@@ -78,6 +84,12 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 static void advertising_work_handler(struct k_work *work)
 {
+    /* Don't restart advertising if radio has been intentionally stopped */
+    if (!ble_radio_active) {
+        LOG_INF("BLE radio stopped, not restarting advertising");
+        return;
+    }
+
     int ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, 
                               ad, ARRAY_SIZE(ad), 
                               sd, ARRAY_SIZE(sd));
@@ -170,6 +182,14 @@ static struct mgmt_callback fs_mgmt_cb = {
     .event_id = MGMT_EVT_OP_FS_MGMT_FILE_ACCESS,
 };
 
+/* Deferred BLE stop handler */
+static void ble_stop_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    LOG_INF("Deferred BLE stop executing");
+    ble_mcumgr_stop();
+}
+
 /* Initialize BLE and mcumgr */
 int ble_mcumgr_init(void)
 {
@@ -214,6 +234,7 @@ int ble_mcumgr_init(void)
     }
 
     k_work_init(&advertising_work, advertising_work_handler);
+    k_work_init_delayable(&ble_stop_work, ble_stop_work_handler);
 
     /* Register connection callbacks */
     bt_conn_cb_register(&conn_callbacks);
@@ -234,6 +255,8 @@ int ble_mcumgr_init(void)
     mgmt_callback_register(&fs_mgmt_cb);
 
     /* Start advertising */
+    ble_radio_active = true;
+
     ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
                           sd, ARRAY_SIZE(sd));
     if (ret) {
@@ -244,6 +267,71 @@ int ble_mcumgr_init(void)
     LOG_INF("BLE advertising started with name: %s", device_name);
 
     return 0;
+}
+
+/* Stop BLE radio: disconnect + stop advertising */
+int ble_mcumgr_stop(void)
+{
+    int ret;
+
+    if (!ble_radio_active) {
+        LOG_DBG("BLE radio already stopped");
+        return 0;
+    }
+
+    LOG_INF("Stopping BLE radio for logging session");
+
+    ble_radio_active = false;
+
+    /* Stop advertising first so no new connections arrive */
+    ret = bt_le_adv_stop();
+    if (ret && ret != -EALREADY) {
+        LOG_WRN("Failed to stop advertising: %d", ret);
+    }
+
+    /* Disconnect any active connection */
+    if (current_conn) {
+        ret = bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        if (ret) {
+            LOG_WRN("Failed to disconnect: %d", ret);
+        }
+        /* The disconnected callback will unref current_conn */
+    }
+
+    LOG_INF("BLE radio stopped");
+    return 0;
+}
+
+/* Restart BLE advertising */
+int ble_mcumgr_restart(void)
+{
+    int ret;
+
+    if (ble_radio_active) {
+        LOG_DBG("BLE radio already active");
+        return 0;
+    }
+
+    LOG_INF("Restarting BLE radio after logging session");
+
+    ble_radio_active = true;
+
+    ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
+                          sd, ARRAY_SIZE(sd));
+    if (ret && ret != -EALREADY) {
+        LOG_ERR("Failed to restart advertising: %d", ret);
+        return ret;
+    }
+
+    LOG_INF("BLE advertising restarted");
+    return 0;
+}
+
+/* Schedule BLE stop after delay (for BLE-initiated logging starts) */
+void ble_mcumgr_stop_deferred(void)
+{
+    LOG_INF("Scheduling BLE stop in 500 ms");
+    k_work_schedule(&ble_stop_work, K_MSEC(500));
 }
 
 /* Get current connection status */

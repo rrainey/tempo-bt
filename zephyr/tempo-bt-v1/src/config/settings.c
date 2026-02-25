@@ -64,7 +64,7 @@ static bool is_uuid_empty(const struct bt_uuid_128 *uuid)
     return true;
 }
 
-/* Settings handler */
+/* Settings handler - must return 0 on success, negative on error */
 static int settings_set_handler(const char *name, size_t len,
                                settings_read_cb read_cb, void *cb_arg)
 {
@@ -76,11 +76,12 @@ static int settings_set_handler(const char *name, size_t len,
             return -EINVAL;
         }
         rc = read_cb(cb_arg, app_settings.ble_name, len);
-        if (rc >= 0) {
-            app_settings.ble_name[len] = '\0';
-            LOG_INF("Set ble_name: %s", app_settings.ble_name);
+        if (rc < 0) {
+            return rc;
         }
-        return rc;
+        app_settings.ble_name[len] = '\0';
+        LOG_INF("Set ble_name: %s", app_settings.ble_name);
+        return 0;
     }
 
     if (settings_name_steq(name, "device_uuid", &next) && !next) {
@@ -88,25 +89,51 @@ static int settings_set_handler(const char *name, size_t len,
             return -EINVAL;
         }
         rc = read_cb(cb_arg, app_settings.device_uuid.val, len);
-        if (rc >= 0) {
-            char uuid_str[BT_UUID_STR_LEN];
-            bt_uuid_to_str((const struct bt_uuid *)&app_settings.device_uuid, 
-                          uuid_str, sizeof(uuid_str));
-            LOG_INF("Set device_uuid: %s", uuid_str);
+        if (rc < 0) {
+            return rc;
         }
-        return rc;
+        char uuid_str[BT_UUID_STR_LEN];
+        bt_uuid_to_str((const struct bt_uuid *)&app_settings.device_uuid,
+                      uuid_str, sizeof(uuid_str));
+        LOG_INF("Set device_uuid: %s", uuid_str);
+        return 0;
     }
 
-    if (settings_name_steq(name, "log_backend", &next) && !next) {
+    if (settings_name_steq(name, "pps", &next) && !next) {
+        if (len != sizeof(app_settings.pps_enabled)) {
+            return -EINVAL;
+        }
+        rc = read_cb(cb_arg, &app_settings.pps_enabled, len);
+        if (rc < 0) {
+            return rc;
+        }
+        LOG_INF("Set pps_enabled: %d", app_settings.pps_enabled);
+        return 0;
+    }
+
+    if (settings_name_steq(name, "pcb", &next) && !next) {
+        if (len != sizeof(app_settings.pcb_variant)) {
+            return -EINVAL;
+        }
+        rc = read_cb(cb_arg, &app_settings.pcb_variant, len);
+        if (rc < 0) {
+            return rc;
+        }
+        LOG_INF("Set pcb_variant: 0x%02X", app_settings.pcb_variant);
+        return 0;
+    }
+
+    if (settings_name_steq(name, "log", &next) && !next) {
         if (len >= sizeof(app_settings.log_backend)) {
             return -EINVAL;
         }
         rc = read_cb(cb_arg, app_settings.log_backend, len);
-        if (rc >= 0) {
-            app_settings.log_backend[len] = '\0';
-            LOG_INF("Set log_backend: %s", app_settings.log_backend);
+        if (rc < 0) {
+            return rc;
         }
-        return rc;
+        app_settings.log_backend[len] = '\0';
+        LOG_INF("Set log_backend: %s", app_settings.log_backend);
+        return 0;
     }
 
     /* Unknown setting */
@@ -122,17 +149,19 @@ int app_settings_init(void)
 {
     int rc;
 
-    /* Register settings handler */
-    rc = settings_register(&app_settings_handler);
-    if (rc) {
-        LOG_ERR("Failed to register settings handler: %d", rc);
-        return rc;
-    }
-
-    /* Initialize settings subsystem */
+    /* Initialize settings subsystem FIRST - settings_init() inside
+     * settings_subsys_init() reinitializes the handlers list, so any
+     * handlers registered before this call would be wiped out. */
     rc = settings_subsys_init();
     if (rc) {
         LOG_ERR("Failed to initialize settings subsystem: %d", rc);
+        return rc;
+    }
+
+    /* Register settings handler AFTER subsystem is initialized */
+    rc = settings_register(&app_settings_handler);
+    if (rc) {
+        LOG_ERR("Failed to register settings handler: %d", rc);
         return rc;
     }
 
@@ -153,6 +182,15 @@ int app_settings_init(void)
             need_save = true;
         } else {
             LOG_ERR("Failed to generate device UUID: %d", rc);
+        }
+    }
+
+    if (need_save) {
+        rc = settings_save_one("app/device_uuid",
+                               app_settings.device_uuid.val,
+                               sizeof(app_settings.device_uuid.val));
+        if (rc) {
+            LOG_ERR("Failed to save device UUID: %d", rc);
         }
     }
 

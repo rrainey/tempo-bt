@@ -21,6 +21,7 @@
 #include "services/gnss.h"
 #include "services/imu.h"
 #include "app/events.h"
+#include "ble_mcumgr.h"
 #ifdef CONFIG_USB_TTY_OUTPUT
 #include "services/usb_tty.h"
 #endif
@@ -321,6 +322,15 @@ int logger_start(void)
     LOG_INF("Logging started: session=%08x, path=%s",
             logger_state.session_id, logger_state.session_path);
 
+    /*
+     * Disable BLE radio during active logging (issue #2).
+     * This eliminates radio interference and saves power during flight.
+     * Note: if logging was initiated via a BLE mcumgr command, the caller
+     * (mcumgr_custom.c) will briefly restart BLE and use ble_mcumgr_stop_deferred()
+     * so the command response can be transmitted first.
+     */
+    ble_mcumgr_stop();
+
     return 0;
 }
 
@@ -417,6 +427,11 @@ int logger_start_usb(void)
     gnss_set_rate(1);
 
     LOG_INF("USB logging started: session=%08x", logger_state.session_id);
+
+    /*
+     * USB mode is a ground test mode — keep BLE active so the device
+     * remains accessible for configuration and monitoring.
+     */
 
     return 0;
 }
@@ -528,6 +543,12 @@ int logger_stop(void)
     if (logger_state.state == LOGGER_STATE_IDLE) {
         start_ground_altitude_sampling();
     }
+
+    /*
+     * Re-enable BLE radio now that logging has stopped (issue #2).
+     * This makes the device discoverable again for file transfer.
+     */
+    ble_mcumgr_restart();
     
     return 0;
 }

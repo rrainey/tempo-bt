@@ -19,6 +19,7 @@
 #include "services/led.h"
 #include "services/timebase.h"
 #include "config/settings.h"
+#include "ble_mcumgr.h"
 
 LOG_MODULE_REGISTER(mcumgr_custom, LOG_LEVEL_INF);
 
@@ -418,6 +419,7 @@ static int tempo_mgmt_logger_control(struct smp_streamer *ctxt)
     int ret = 0;
     logger_state_t current_state = logger_get_state();
     logger_state_t new_state = current_state;
+    bool started_via_ble = false;  /* Track if we started logging from this BLE command */
     
     if (action_str.len == 5 && memcmp(action_str.value, "start", 5) == 0) {
         /* Start logging */
@@ -425,6 +427,7 @@ static int tempo_mgmt_logger_control(struct smp_streamer *ctxt)
             ret = logger_start();
             if (ret == 0) {
                 new_state = LOGGER_STATE_LOGGING;
+                started_via_ble = true;
             }
         } else if (current_state == LOGGER_STATE_IDLE) {
             /* Auto-arm then start */
@@ -433,6 +436,7 @@ static int tempo_mgmt_logger_control(struct smp_streamer *ctxt)
                 ret = logger_start();
                 if (ret == 0) {
                     new_state = LOGGER_STATE_LOGGING;
+                    started_via_ble = true;
                 }
             }
         } else {
@@ -479,6 +483,17 @@ static int tempo_mgmt_logger_control(struct smp_streamer *ctxt)
     
     if (ret != 0) {
         return MGMT_ERR_EUNKNOWN;
+    }
+
+    /*
+     * BLE-initiated logging start (issue #2):
+     * logger_start() already called ble_mcumgr_stop() which killed the radio.
+     * We need to briefly re-enable BLE so this mcumgr response can be sent,
+     * then schedule a deferred stop (500ms) to shut it down again.
+     */
+    if (started_via_ble) {
+        ble_mcumgr_restart();
+        ble_mcumgr_stop_deferred();
     }
     
     /* Build response with current state and session info */
@@ -939,6 +954,13 @@ static int tempo_mgmt_test_logging(struct smp_streamer *ctxt)
 
     LOG_INF("Test logging scheduled: start=%02u:%02u (%u sec), jump=%u sec",
             mm, ss, seconds_until_start, test_alarm.jump_delay_sec);
+
+    /*
+     * TEST_LOGGING schedules a future start via PPS alarm — the actual
+     * logger_start() will be called later and will disable BLE at that point.
+     * The response goes out now while BLE is still active, so no deferred
+     * stop is needed here.
+     */
 
     /* Build response */
     ok = zcbor_tstr_put_lit(zse, "success") &&
