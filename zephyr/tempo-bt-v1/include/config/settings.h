@@ -81,11 +81,26 @@ int app_settings_set_pcb_variant(uint8_t variant);
 
 /**
  * @brief Set log backend type
- * 
+ *
  * @param backend Backend type ("littlefs" or "fatfs")
  * @return 0 on success, negative error code on failure
  */
 int app_settings_set_log_backend(const char *backend);
+
+/**
+ * @brief Get magnetometer integration mode
+ *
+ * @return 0=disabled, 1=factory calibration, 2=NVM calibration
+ */
+uint8_t app_settings_get_mag_mode(void);
+
+/**
+ * @brief Set magnetometer integration mode
+ *
+ * @param mode 0=disabled, 1=factory calibration, 2=NVM calibration
+ * @return 0 on success, negative error code on failure
+ */
+int app_settings_set_mag_mode(uint8_t mode);
 
 /**
  * @brief Generate a new random UUID

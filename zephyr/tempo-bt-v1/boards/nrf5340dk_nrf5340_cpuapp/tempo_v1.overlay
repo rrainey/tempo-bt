@@ -228,13 +228,12 @@
         int-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
     };
     
-    /* 
     mmc5983ma: mmc5983ma@30 {
         compatible = "memsic,mmc5983ma";
         reg = <0x30>;
-        int-gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;
+        bandwidth = <0>;        /* BW=00: 8ms measurement, lowest noise */
+        auto-sr;                /* Enable automatic SET/RESET */
     };
-    */
 
 };
 

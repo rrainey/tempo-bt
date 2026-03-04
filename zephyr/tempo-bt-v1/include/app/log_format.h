@@ -21,7 +21,8 @@
 #define LOG_SENTENCE_IM2    "$PIM2"   /* IMU quaternion */
 #define LOG_SENTENCE_ENV    "$PENV"   /* Environmental (baro + temp) */
 #define LOG_SENTENCE_ST     "$PST"    /* State change */
-#define LOG_SENTENCE_MAG    "$PMAG"   /* Magnetometer (optional) */
+#define LOG_SENTENCE_MAG    "$PMAG"   /* Calibrated magnetometer (uT) */
+#define LOG_SENTENCE_RMG    "$PRMG"  /* Raw magnetometer (counts, for calibration) */
 #define LOG_SENTENCE_VER    "$PVER"   /* Version info with date */
 #define LOG_SENTENCE_TH     "$PTH"    /* Time Hack */
 #define LOG_SENTENCE_FIX    "$PFIX"   /* GPS fix data (proposed; unused) */
@@ -125,15 +126,27 @@ typedef struct {
     const char *trigger;      /* What triggered the change */
 } log_st_t;
 
-/* Magnetometer sentence format (optional):
+/* Calibrated magnetometer sentence format (optional):
  * $PMAG,<timestamp_ms>,<mx>,<my>,<mz>*HH
- * Example: $PMAG,123456,23.5,-12.3,45.6*9A
- * Units: microTesla
+ * Example: $PMAG,123456,23.50,-12.30,45.60*9A
+ * Units: microTesla (uT). Earth field ~25-65 uT.
  */
 typedef struct {
     uint32_t timestamp_ms;    /* Milliseconds since session start */
-    float mx, my, mz;         /* Magnetic field X, Y, Z in uT */
+    float mx, my, mz;         /* Calibrated magnetic field X, Y, Z in uT */
 } log_mag_t;
+
+/* Raw magnetometer sentence format (calibration streaming):
+ * $PRMG,<timestamp_ms>,<raw_x>,<raw_y>,<raw_z>,<temp_c>*HH
+ * Example: $PRMG,123456,8192,-4096,12288,25.3*4B
+ * Units: signed 18-bit counts (16384 counts/Gauss), native sensor frame.
+ * SET/RESET corrected but NOT hard/soft-iron calibrated.
+ */
+typedef struct {
+    uint32_t timestamp_ms;    /* Milliseconds since boot */
+    int32_t raw_x, raw_y, raw_z;  /* Raw counts (16384 counts/Gauss) */
+    float temp_c;             /* Die temperature in Celsius */
+} log_rmg_t;
 
 /* Helper functions */
 

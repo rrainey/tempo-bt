@@ -5,3 +5,10 @@ external
 
 
 .venv/
+**/mag_venv/**
+mag_cal.json
+mag_cal.bin
+mag_cal.csv
+
+*.pyc
+__pycache__/

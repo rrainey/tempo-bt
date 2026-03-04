@@ -32,6 +32,8 @@ int mag_configure(const mag_config_t *config) { return -ENODEV; }
 int mag_get_config(mag_config_t *config) { return -ENODEV; }
 int mag_read(mag_sample_t *sample) { return -ENODEV; }
 int mag_read_fusion(FusionVector *vec) { return -ENODEV; }
+int mag_read_raw_counts(int32_t *raw_x, int32_t *raw_y, int32_t *raw_z,
+                        float *temp_c) { return -ENODEV; }
 int mag_set(void) { return -ENODEV; }
 int mag_reset(void) { return -ENODEV; }
 int mag_cal_start(void) { return -ENODEV; }
@@ -330,6 +332,11 @@ int mag_read(mag_sample_t *sample)
 
 /*
  * Get magnetometer reading as FusionVector
+ *
+ * Applies coordinate frame rotation from MMC5983MA frame to ICM-42688-V frame:
+ *   ICM +X = MAG -Y
+ *   ICM +Y = MAG +X
+ *   ICM +Z = MAG -Z
  */
 int mag_read_fusion(FusionVector *vec)
 {
@@ -345,10 +352,43 @@ int mag_read_fusion(FusionVector *vec)
         return ret;
     }
 
-    /* Return normalized vector for AHRS */
-    vec->axis.x = sample.norm_x;
-    vec->axis.y = sample.norm_y;
-    vec->axis.z = sample.norm_z;
+    /* Return normalized vector rotated to IMU coordinate frame */
+    vec->axis.x = -sample.norm_y;   /* IMU +X = MAG -Y */
+    vec->axis.y =  sample.norm_x;   /* IMU +Y = MAG +X */
+    vec->axis.z = -sample.norm_z;   /* IMU +Z = MAG -Z */
+
+    return 0;
+}
+
+/*
+ * Read raw magnetometer counts for calibration streaming
+ */
+int mag_read_raw_counts(int32_t *raw_x, int32_t *raw_y, int32_t *raw_z,
+                        float *temp_c)
+{
+    int ret;
+
+    if (!state.initialized) {
+        return -ENODEV;
+    }
+
+    /* Read raw mag values */
+    ret = mag_read_raw(raw_x, raw_y, raw_z);
+    if (ret < 0) {
+        return ret;
+    }
+
+    /* Read temperature */
+    *temp_c = 0.0f;
+    struct sensor_value temp_val;
+    ret = sensor_sample_fetch_chan(mag_dev, SENSOR_CHAN_DIE_TEMP);
+    if (ret == 0) {
+        ret = sensor_channel_get(mag_dev, SENSOR_CHAN_DIE_TEMP, &temp_val);
+        if (ret == 0) {
+            *temp_c = (float)temp_val.val1 +
+                      (float)temp_val.val2 / 1000000.0f;
+        }
+    }
 
     return 0;
 }

@@ -27,13 +27,17 @@ static struct {
     
     /* Storage */
     char log_backend[12]; /* "littlefs" or "fatfs" */
+
+    /* Magnetometer */
+    uint8_t mag_mode;    /* 0=disabled, 1=factory cal, 2=NVM cal */
 } app_settings = {
     /* Default values */
     .ble_name = "Tempo-BT",
     .device_uuid = BT_UUID_INIT_128(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     .pps_enabled = false, /* No PPS on V1 */
     .pcb_variant = 0x01,  /* V1 hardware */
-    .log_backend = "littlefs"
+    .log_backend = "littlefs",
+    .mag_mode = 0         /* Disabled by default */
 };
 
 /* Generate a new random UUID */
@@ -133,6 +137,18 @@ static int settings_set_handler(const char *name, size_t len,
         }
         app_settings.log_backend[len] = '\0';
         LOG_INF("Set log_backend: %s", app_settings.log_backend);
+        return 0;
+    }
+
+    if (settings_name_steq(name, "mag_mode", &next) && !next) {
+        if (len != sizeof(app_settings.mag_mode)) {
+            return -EINVAL;
+        }
+        rc = read_cb(cb_arg, &app_settings.mag_mode, len);
+        if (rc < 0) {
+            return rc;
+        }
+        LOG_INF("Set mag_mode: %u", app_settings.mag_mode);
         return 0;
     }
 
@@ -264,9 +280,24 @@ int app_settings_set_log_backend(const char *backend)
     if (!backend || strlen(backend) >= sizeof(app_settings.log_backend)) {
         return -EINVAL;
     }
-    
+
     strcpy(app_settings.log_backend, backend);
     return settings_save_one("app/log", backend, strlen(backend));
+}
+
+uint8_t app_settings_get_mag_mode(void)
+{
+    return app_settings.mag_mode;
+}
+
+int app_settings_set_mag_mode(uint8_t mode)
+{
+    if (mode > 2) {
+        return -EINVAL;
+    }
+
+    app_settings.mag_mode = mode;
+    return settings_save_one("app/mag_mode", &mode, sizeof(mode));
 }
 
 /* Test function to demonstrate settings */

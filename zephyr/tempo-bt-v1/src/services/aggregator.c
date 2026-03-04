@@ -20,6 +20,10 @@
 #include "services/orientation.h"
 #include "services/file_writer.h"
 #include "app/log_format.h"
+#if CONFIG_USE_MAG_IN_ORIENTATION
+#include "services/mag.h"
+#endif
+#include "config/settings.h"
 
 LOG_MODULE_REGISTER(aggregator, LOG_LEVEL_INF);
 
@@ -317,6 +321,25 @@ static void imu_output_handler(struct k_work *work)
         }
     }
 
+    /* Output calibrated magnetometer data in uT */
+#if CONFIG_USE_MAG_IN_ORIENTATION
+    if (config.enable_magnetometer && mag_is_ready()) {
+        mag_sample_t mag;
+        if (mag_read(&mag) == 0) {
+            /* Convert Gauss to uT (1 G = 100 uT) */
+            len = log_format_sentence(line, sizeof(line),
+                                      "$PMAG,%u,%.2f,%.2f,%.2f",
+                                      timestamp_ms,
+                                      mag.mag_x * 100.0f,
+                                      mag.mag_y * 100.0f,
+                                      mag.mag_z * 100.0f);
+            if (len > 0) {
+                output_callback(line, len);
+            }
+        }
+    }
+#endif
+
 reschedule:
     if (running) {
         k_work_reschedule(&imu_output_work, K_MSEC(IMU_OUTPUT_PERIOD_MS));
@@ -397,7 +420,7 @@ int aggregator_init(void)
     orientation_config_t orient_cfg = {
         .gain = 0.5f,                    /* Fusion AHRS gain */
         .sample_period = 0.005f,         /* 200Hz */
-        .use_magnetometer = false,
+        .use_magnetometer = (app_settings_get_mag_mode() > 0),
         .acceleration_rejection = 10.0f,  /* 10 m/s² */
         .magnetic_rejection = 10.0f,
         .recovery_trigger_period = 5.0f

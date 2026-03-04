@@ -18,6 +18,7 @@
 #include "services/logger.h"
 #include "services/led.h"
 #include "services/timebase.h"
+#include "services/mag.h"
 #include "config/settings.h"
 #include "ble_mcumgr.h"
 
@@ -108,6 +109,8 @@ uint32_t test_alarm_decrement_countdown(void)
 #define TEMPO_MGMT_ID_SETTINGS_SET     7
 #define TEMPO_MGMT_ID_GET_DATETIME     8
 #define TEMPO_MGMT_ID_TEST_LOGGING     9
+#define TEMPO_MGMT_ID_MAG_CAL_GET    10
+#define TEMPO_MGMT_ID_MAG_CAL_SET    11
 
 /* List callback context */
 struct list_context {
@@ -644,6 +647,8 @@ static int tempo_mgmt_settings_get(struct smp_streamer *ctxt)
     uint8_t pcb_variant = app_settings_get_pcb_variant();
     const char *log_backend = app_settings_get_log_backend();
     
+    uint8_t mag_mode = app_settings_get_mag_mode();
+
     /* Build response with all settings */
     bool ok = zcbor_tstr_put_lit(zse, "ble_name") &&
               zcbor_tstr_put_term(zse, ble_name, 32) &&
@@ -652,14 +657,16 @@ static int tempo_mgmt_settings_get(struct smp_streamer *ctxt)
               zcbor_tstr_put_lit(zse, "pcb_variant") &&
               zcbor_uint32_put(zse, pcb_variant) &&
               zcbor_tstr_put_lit(zse, "log_backend") &&
-              zcbor_tstr_put_term(zse, log_backend, 12);
-    
+              zcbor_tstr_put_term(zse, log_backend, 12) &&
+              zcbor_tstr_put_lit(zse, "mag_mode") &&
+              zcbor_uint32_put(zse, mag_mode);
+
     if (!ok) {
         return MGMT_ERR_EMSGSIZE;
     }
-    
-    LOG_INF("Settings get: ble_name=%s, pps=%d, pcb=0x%02X, backend=%s", 
-            ble_name, pps_enabled, pcb_variant, log_backend);
+
+    LOG_INF("Settings get: ble_name=%s, pps=%d, pcb=0x%02X, backend=%s, mag_mode=%u",
+            ble_name, pps_enabled, pcb_variant, log_backend, mag_mode);
     
     return 0;
 }
@@ -681,11 +688,13 @@ static int tempo_mgmt_settings_set(struct smp_streamer *ctxt)
     bool has_pps = false;
     bool has_pcb = false;
     bool has_backend = false;
-    
+    bool has_mag_mode = false;
+
     char new_ble_name[32];
     bool new_pps;
     uint8_t new_pcb = 1;
     char new_backend[12];
+    uint8_t new_mag_mode = 0;
     
     /* Start decoding the map */
     ok = zcbor_map_start_decode(zsd);
@@ -721,6 +730,13 @@ static int tempo_mgmt_settings_set(struct smp_streamer *ctxt)
                 memcpy(new_backend, str_value.value, str_value.len);
                 new_backend[str_value.len] = '\0';
                 has_backend = true;
+            }
+        }
+        else if (key.len == 8 && memcmp(key.value, "mag_mode", 8) == 0) {
+            ok = zcbor_uint32_decode(zsd, &uint_value);
+            if (ok && uint_value <= 2) {
+                new_mag_mode = (uint8_t)uint_value;
+                has_mag_mode = true;
             }
         }
         else {
@@ -776,13 +792,24 @@ static int tempo_mgmt_settings_set(struct smp_streamer *ctxt)
         }
         LOG_INF("Set log_backend: %s", new_backend);
     }
-    
+
+    if (has_mag_mode) {
+        ret = app_settings_set_mag_mode(new_mag_mode);
+        if (ret != 0) {
+            LOG_ERR("Failed to set mag_mode: %d", ret);
+            return MGMT_ERR_EUNKNOWN;
+        }
+        LOG_INF("Set mag_mode: %u", new_mag_mode);
+    }
+
     /* Build response with all current settings (after updates) */
     const char *ble_name = app_settings_get_ble_name();
     bool pps_enabled = app_settings_get_pps_enabled();
     uint8_t pcb_variant = app_settings_get_pcb_variant();
     const char *log_backend = app_settings_get_log_backend();
     
+    uint8_t mag_mode = app_settings_get_mag_mode();
+
     ok = zcbor_tstr_put_lit(zse, "ble_name") &&
          zcbor_tstr_put_term(zse, ble_name, 32) &&
          zcbor_tstr_put_lit(zse, "pps_enabled") &&
@@ -791,9 +818,11 @@ static int tempo_mgmt_settings_set(struct smp_streamer *ctxt)
          zcbor_uint32_put(zse, pcb_variant) &&
          zcbor_tstr_put_lit(zse, "log_backend") &&
          zcbor_tstr_put_term(zse, log_backend, 12) &&
+         zcbor_tstr_put_lit(zse, "mag_mode") &&
+         zcbor_uint32_put(zse, mag_mode) &&
          zcbor_tstr_put_lit(zse, "success") &&
          zcbor_bool_put(zse, true);
-    
+
     if (has_ble_name) {
         ok = ok && zcbor_tstr_put_lit(zse, "note") &&
              zcbor_tstr_put_lit(zse, "BLE name changes require reboot");
@@ -981,6 +1010,161 @@ static int tempo_mgmt_test_logging(struct smp_streamer *ctxt)
     return 0;
 }
 
+/* Get magnetometer calibration data */
+static int tempo_mgmt_mag_cal_get(struct smp_streamer *ctxt)
+{
+    zcbor_state_t *zse = ctxt->writer->zs;
+    mag_calibration_t cal;
+
+    mag_cal_get(&cal);
+
+    bool ok = zcbor_tstr_put_lit(zse, "valid") &&
+              zcbor_bool_put(zse, cal.valid) &&
+              zcbor_tstr_put_lit(zse, "offset_x") &&
+              zcbor_int32_put(zse, cal.offset_x) &&
+              zcbor_tstr_put_lit(zse, "offset_y") &&
+              zcbor_int32_put(zse, cal.offset_y) &&
+              zcbor_tstr_put_lit(zse, "offset_z") &&
+              zcbor_int32_put(zse, cal.offset_z) &&
+              zcbor_tstr_put_lit(zse, "scale_x") &&
+              zcbor_uint32_put(zse, cal.scale_x) &&
+              zcbor_tstr_put_lit(zse, "scale_y") &&
+              zcbor_uint32_put(zse, cal.scale_y) &&
+              zcbor_tstr_put_lit(zse, "scale_z") &&
+              zcbor_uint32_put(zse, cal.scale_z);
+
+    if (!ok) {
+        return MGMT_ERR_EMSGSIZE;
+    }
+
+    LOG_INF("Mag cal get: valid=%d, offsets=[%d,%d,%d], scales=[%u,%u,%u]",
+            cal.valid, cal.offset_x, cal.offset_y, cal.offset_z,
+            cal.scale_x, cal.scale_y, cal.scale_z);
+
+    return 0;
+}
+
+/* Set magnetometer calibration data and persist to NVM */
+static int tempo_mgmt_mag_cal_set(struct smp_streamer *ctxt)
+{
+    zcbor_state_t *zsd = ctxt->reader->zs;
+    zcbor_state_t *zse = ctxt->writer->zs;
+
+    bool ok;
+    struct zcbor_string key;
+    int32_t int_value;
+    uint32_t uint_value;
+    mag_calibration_t cal = {0};
+    bool has_offset_x = false, has_offset_y = false, has_offset_z = false;
+    bool has_scale_x = false, has_scale_y = false, has_scale_z = false;
+
+    /* Start decoding the map */
+    ok = zcbor_map_start_decode(zsd);
+    if (!ok) {
+        LOG_ERR("Failed to start decoding map");
+        return MGMT_ERR_EINVAL;
+    }
+
+    /* Decode each field */
+    while (zcbor_tstr_decode(zsd, &key)) {
+        if (key.len == 8 && memcmp(key.value, "offset_x", 8) == 0) {
+            ok = zcbor_int32_decode(zsd, &int_value);
+            if (ok) { cal.offset_x = int_value; has_offset_x = true; }
+        }
+        else if (key.len == 8 && memcmp(key.value, "offset_y", 8) == 0) {
+            ok = zcbor_int32_decode(zsd, &int_value);
+            if (ok) { cal.offset_y = int_value; has_offset_y = true; }
+        }
+        else if (key.len == 8 && memcmp(key.value, "offset_z", 8) == 0) {
+            ok = zcbor_int32_decode(zsd, &int_value);
+            if (ok) { cal.offset_z = int_value; has_offset_z = true; }
+        }
+        else if (key.len == 7 && memcmp(key.value, "scale_x", 7) == 0) {
+            ok = zcbor_uint32_decode(zsd, &uint_value);
+            if (ok && uint_value <= UINT16_MAX) {
+                cal.scale_x = (uint16_t)uint_value;
+                has_scale_x = true;
+            }
+        }
+        else if (key.len == 7 && memcmp(key.value, "scale_y", 7) == 0) {
+            ok = zcbor_uint32_decode(zsd, &uint_value);
+            if (ok && uint_value <= UINT16_MAX) {
+                cal.scale_y = (uint16_t)uint_value;
+                has_scale_y = true;
+            }
+        }
+        else if (key.len == 7 && memcmp(key.value, "scale_z", 7) == 0) {
+            ok = zcbor_uint32_decode(zsd, &uint_value);
+            if (ok && uint_value <= UINT16_MAX) {
+                cal.scale_z = (uint16_t)uint_value;
+                has_scale_z = true;
+            }
+        }
+        else {
+            /* Skip unknown keys */
+            ok = zcbor_any_skip(zsd, NULL);
+        }
+
+        if (!ok) {
+            LOG_ERR("Failed to decode value");
+            return MGMT_ERR_EINVAL;
+        }
+    }
+
+    ok = zcbor_map_end_decode(zsd);
+    if (!ok) {
+        LOG_ERR("Failed to end decoding map");
+        return MGMT_ERR_EINVAL;
+    }
+
+    /* All six fields are required */
+    if (!has_offset_x || !has_offset_y || !has_offset_z ||
+        !has_scale_x || !has_scale_y || !has_scale_z) {
+        LOG_ERR("Missing required calibration fields");
+        return MGMT_ERR_EINVAL;
+    }
+
+    /* Apply and save */
+    cal.valid = true;
+    int ret = mag_cal_set(&cal);
+    if (ret != 0) {
+        LOG_ERR("Failed to set calibration: %d", ret);
+        return MGMT_ERR_EUNKNOWN;
+    }
+
+    ret = mag_cal_save();
+    if (ret != 0) {
+        LOG_ERR("Failed to save calibration: %d", ret);
+        return MGMT_ERR_EUNKNOWN;
+    }
+
+    /* Build success response */
+    ok = zcbor_tstr_put_lit(zse, "success") &&
+         zcbor_bool_put(zse, true) &&
+         zcbor_tstr_put_lit(zse, "offset_x") &&
+         zcbor_int32_put(zse, cal.offset_x) &&
+         zcbor_tstr_put_lit(zse, "offset_y") &&
+         zcbor_int32_put(zse, cal.offset_y) &&
+         zcbor_tstr_put_lit(zse, "offset_z") &&
+         zcbor_int32_put(zse, cal.offset_z) &&
+         zcbor_tstr_put_lit(zse, "scale_x") &&
+         zcbor_uint32_put(zse, cal.scale_x) &&
+         zcbor_tstr_put_lit(zse, "scale_y") &&
+         zcbor_uint32_put(zse, cal.scale_y) &&
+         zcbor_tstr_put_lit(zse, "scale_z") &&
+         zcbor_uint32_put(zse, cal.scale_z);
+
+    if (!ok) {
+        return MGMT_ERR_EMSGSIZE;
+    }
+
+    LOG_INF("Mag cal set and saved: offsets=[%d,%d,%d], scales=[%u,%u,%u]",
+            cal.offset_x, cal.offset_y, cal.offset_z,
+            cal.scale_x, cal.scale_y, cal.scale_z);
+
+    return 0;
+}
+
 /* Command handlers table */
 static const struct mgmt_handler tempo_mgmt_handlers[] = {
     [TEMPO_MGMT_ID_SESSION_LIST] = {
@@ -1022,6 +1206,14 @@ static const struct mgmt_handler tempo_mgmt_handlers[] = {
     [TEMPO_MGMT_ID_TEST_LOGGING] = {
         .mh_read = NULL,
         .mh_write = tempo_mgmt_test_logging,
+    },
+    [TEMPO_MGMT_ID_MAG_CAL_GET] = {
+        .mh_read = tempo_mgmt_mag_cal_get,
+        .mh_write = NULL,
+    },
+    [TEMPO_MGMT_ID_MAG_CAL_SET] = {
+        .mh_read = NULL,
+        .mh_write = tempo_mgmt_mag_cal_set,
     },
 };
 

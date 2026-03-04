@@ -6,12 +6,12 @@
 #ifndef APP_VERSION_H
 #define APP_VERSION_H
 
-#define APP_VERSION_STRING "1.2.0"
-#define APP_GIT_COMMIT "b1d09be-dirty"
-#define APP_BUILD_DATE "2026-02-24"
+#define APP_VERSION_STRING "1.3.0"
+#define APP_GIT_COMMIT "0dff03f-dirty"
+#define APP_BUILD_DATE "2026-03-03"
 #define APP_DEVICE_TYPE "V2"
 #define APP_VERSION_MAJOR 1
-#define APP_VERSION_MINOR 2
+#define APP_VERSION_MINOR 3
 #define APP_VERSION_PATCH 0
 
 /* Numeric version for Tempo (1xx) vs Dropkick (0xx) differentiation */

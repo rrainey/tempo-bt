@@ -216,6 +216,24 @@ int mag_cal_load(void);
 int mag_cal_clear(void);
 
 /**
+ * @brief Read raw magnetometer counts for calibration streaming
+ *
+ * Returns SET/RESET-corrected raw 18-bit signed counts (NOT calibrated)
+ * in the magnetometer's native coordinate frame. Intended for streaming
+ * to a desktop calibration tool via $PRMG sentences.
+ *
+ * Sensitivity: 16384 counts/Gauss.
+ *
+ * @param raw_x Output: raw X counts
+ * @param raw_y Output: raw Y counts
+ * @param raw_z Output: raw Z counts
+ * @param temp_c Output: die temperature in Celsius
+ * @return 0 on success, negative error code on failure
+ */
+int mag_read_raw_counts(int32_t *raw_x, int32_t *raw_y, int32_t *raw_z,
+                        float *temp_c);
+
+/**
  * @brief Check if magnetometer is initialized and ready
  *
  * @return true if ready, false otherwise

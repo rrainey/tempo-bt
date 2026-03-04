@@ -27,9 +27,14 @@
 #include "services/led.h"
 #include "services/aggregator.h"
 #include "services/orientation.h"
+#if CONFIG_MMC5983MA
+#include "services/mag.h"
+#endif
 #include "util/nmea_checksum.h"
+#include "app/log_format.h"
 #ifdef CONFIG_USB_TTY_OUTPUT
 #include "services/usb_tty.h"
+#include "ble_mcumgr.h"
 #endif
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -74,6 +79,73 @@ static int64_t button1_press_time;
 
 /* Forward declaration for LED state update */
 static void update_led_for_state(logger_state_t state);
+
+/* Magnetometer calibration streaming state */
+#if CONFIG_MMC5983MA && defined(CONFIG_USB_TTY_OUTPUT)
+static volatile bool mag_cal_streaming;
+static struct k_work button1_short_press_work;
+static struct k_work_delayable mag_cal_stream_work;
+
+#define MAG_CAL_STREAM_PERIOD_MS  50  /* 20 Hz raw mag output */
+
+static void mag_cal_stream_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (!mag_cal_streaming) {
+        return;
+    }
+
+    int32_t raw_x, raw_y, raw_z;
+    float temp_c;
+    int ret = mag_read_raw_counts(&raw_x, &raw_y, &raw_z, &temp_c);
+
+    if (ret == 0) {
+        char line[LOG_MAX_SENTENCE_LEN];
+        uint32_t timestamp_ms = (uint32_t)(k_uptime_get() & 0xFFFFFFFF);
+        int len = log_format_sentence(line, sizeof(line),
+                                      "$PRMG,%u,%d,%d,%d,%.1f",
+                                      timestamp_ms,
+                                      raw_x, raw_y, raw_z, (double)temp_c);
+        if (len > 0) {
+            usb_tty_output_line(line, len);
+        }
+    }
+
+    k_work_reschedule(&mag_cal_stream_work, K_MSEC(MAG_CAL_STREAM_PERIOD_MS));
+}
+
+static void button1_short_press_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (mag_cal_streaming) {
+        /* Stop calibration streaming */
+        mag_cal_streaming = false;
+        k_work_cancel_delayable(&mag_cal_stream_work);
+        usb_tty_close();
+        LOG_INF("Mag calibration streaming stopped");
+        ble_mcumgr_restart();
+        update_led_for_state(logger_get_state());
+    } else {
+        /* Start calibration streaming */
+        if (!mag_is_ready()) {
+            LOG_WRN("Magnetometer not ready for calibration");
+            return;
+        }
+        int ret = usb_tty_open();
+        if (ret == -ENOTCONN) {
+            LOG_INF("BTN1 short: no USB host connected, ignoring");
+            return;
+        }
+        mag_cal_streaming = true;
+        LOG_INF("Mag calibration streaming started (20 Hz $PRMG)");
+        ble_mcumgr_stop();
+        set_color_led_state(RGB_MAGENTA, true);
+        k_work_schedule(&mag_cal_stream_work, K_NO_WAIT);
+    }
+}
+#endif /* CONFIG_MMC5983MA && CONFIG_USB_TTY_OUTPUT */
 
 /* Button work handler for long press detection */
 static void button0_work_handler(struct k_work *work)
@@ -166,7 +238,7 @@ static void button1_work_handler(struct k_work *work)
     }
 }
 
-/* Button 1 action — runs outside ISR context */
+/* Button 1 (BTN2) action — runs outside ISR context */
 static void button1_action_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
@@ -208,6 +280,22 @@ static void button1_isr(const struct device *dev, struct gpio_callback *cb,
     } else {
         /* Released — cancel long press detection */
         k_work_cancel_delayable(&button1_work);
+
+        /* Detect short press for mag calibration toggle */
+        int64_t press_duration = k_uptime_get() - button1_press_time;
+        if (press_duration < BUTTON_LONG_PRESS_MS &&
+            press_duration > BUTTON_DEBOUNCE_DELAY_MS) {
+#if CONFIG_MMC5983MA && defined(CONFIG_USB_TTY_OUTPUT)
+            /* Short press: toggle mag calibration streaming
+             * (only when not actively logging) */
+            logger_state_t state = logger_get_state();
+            if (mag_cal_streaming ||
+                state == LOGGER_STATE_IDLE ||
+                state == LOGGER_STATE_ARMED) {
+                k_work_submit(&button1_short_press_work);
+            }
+#endif
+        }
     }
 }
 #endif
@@ -280,6 +368,10 @@ int buttons_init(void)
 
     k_work_init_delayable(&button1_work, button1_work_handler);
     k_work_init(&button1_action_work, button1_action_handler);
+#if CONFIG_MMC5983MA && defined(CONFIG_USB_TTY_OUTPUT)
+    k_work_init(&button1_short_press_work, button1_short_press_handler);
+    k_work_init_delayable(&mag_cal_stream_work, mag_cal_stream_handler);
+#endif
 
     gpio_init_callback(&button1_cb_data, button1_isr, BIT(button1.pin));
     gpio_add_callback(button1.port, &button1_cb_data);
@@ -364,12 +456,6 @@ static void indicate_system_error(const char *error_msg)
     set_color_led_state(RGB_RED, true);
 }
 
-static void indicate_system_ready(void)
-{
-    LOG_INF("System ready");
-    set_color_led_state(RGB_BLUE, true);
-}
-
 #if 0
 /* Example usage in button handlers: */
 static void button0_work_handler_with_led(struct k_work *work)
@@ -420,13 +506,6 @@ static void test_version_output(const char *line, size_t len)
 int main(void)
 {
     int ret;
-
-    const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-    //if (device_is_ready(uart)) {
-    //    for (const char *p = "UART TEST\r\n"; *p; p++) {
-    //        uart_poll_out(uart, *p);
-    //    }
-    //}
 
     /*
      * Quiet the GNSS module VERY early - before any other initialization.
@@ -671,6 +750,27 @@ int main(void)
         }
     }
 
+    /* Initialize Magnetometer */
+#if CONFIG_MMC5983MA
+    LOG_INF("Initializing magnetometer...");
+    ret = mag_init();
+    if (ret < 0) {
+        LOG_WRN("Magnetometer init failed: %d (non-critical)", ret);
+    } else {
+        uint8_t mag_mode = app_settings_get_mag_mode();
+        if (mag_mode == 1) {
+            /* Factory cal only: clear any NVM-loaded calibration */
+            mag_cal_clear();
+            LOG_INF("Mag mode 1: using factory calibration only");
+        } else if (mag_mode == 2) {
+            LOG_INF("Mag mode 2: using NVM calibration (valid=%d)",
+                    mag_is_calibrated());
+        } else {
+            LOG_INF("Mag mode 0: magnetometer disabled for AHRS");
+        }
+    }
+#endif
+
 #ifdef CONFIG_SHELL
 
     //orientation_test_init();
@@ -707,7 +807,7 @@ int main(void)
         .env_rate_hz = 4,       /* Barometer data at 4 Hz in logs */
         .gnss_rate_hz = 1,      /* GPS at 1 Hz normally */
         .enable_quaternion = true,  /* include quaternion orientation */
-        .enable_magnetometer = false,
+        .enable_magnetometer = (app_settings_get_mag_mode() > 0),
         .auto_start_on_takeoff = true,   /* ENABLE THIS for automatic detection */
         .auto_stop_on_landing = true     /* Also enable automatic stop */
     };
