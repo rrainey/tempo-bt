@@ -34,6 +34,7 @@
 #include "app/log_format.h"
 #ifdef CONFIG_USB_TTY_OUTPUT
 #include "services/usb_tty.h"
+#include "services/usb_cmd.h"
 #include "ble_mcumgr.h"
 #endif
 
@@ -115,6 +116,23 @@ static void mag_cal_stream_handler(struct k_work *work)
     k_work_reschedule(&mag_cal_stream_work, K_MSEC(MAG_CAL_STREAM_PERIOD_MS));
 }
 
+/*
+ * USB disconnect handler for mag calibration mode.
+ * Called from system workqueue when the host closes the serial port.
+ */
+static void mag_cal_disconnect_handler(void)
+{
+    if (mag_cal_streaming) {
+        mag_cal_streaming = false;
+        k_work_cancel_delayable(&mag_cal_stream_work);
+        usb_cmd_set_active(false);
+        usb_tty_close();
+        ble_mcumgr_restart();
+        update_led_for_state(logger_get_state());
+        LOG_INF("Mag cal stopped (USB disconnect)");
+    }
+}
+
 static void button1_short_press_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
@@ -123,6 +141,7 @@ static void button1_short_press_handler(struct k_work *work)
         /* Stop calibration streaming */
         mag_cal_streaming = false;
         k_work_cancel_delayable(&mag_cal_stream_work);
+        usb_cmd_set_active(false);
         usb_tty_close();
         LOG_INF("Mag calibration streaming stopped");
         ble_mcumgr_restart();
@@ -139,7 +158,9 @@ static void button1_short_press_handler(struct k_work *work)
             return;
         }
         mag_cal_streaming = true;
-        LOG_INF("Mag calibration streaming started (20 Hz $PRMG)");
+        usb_cmd_set_active(true);
+        usb_tty_register_disconnect_callback(mag_cal_disconnect_handler);
+        LOG_INF("Mag calibration streaming started (20 Hz $PRMG + commands)");
         ble_mcumgr_stop();
         set_color_led_state(RGB_MAGENTA, true);
         k_work_schedule(&mag_cal_stream_work, K_NO_WAIT);
@@ -534,6 +555,7 @@ int main(void)
         LOG_ERR("USB TTY init failed: %d", ret);
         /* Non-critical — continue without USB TTY capability */
     }
+    usb_cmd_init();
 #endif
 
     // Initialize storage first

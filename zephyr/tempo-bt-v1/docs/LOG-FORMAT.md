@@ -165,6 +165,77 @@ isolate specific segments of the jump during post-jump analysis.
 
 `$PST,1000,FLIGHT`
 
+## $PMAG Record (Tempo-BT devices with MMC5983MA)
+
+This record logs calibrated magnetometer data from the MMC5983MA. Only emitted when `mag_mode > 0` and calibration is valid. Values are in the device body axis frame after hard/soft iron correction.
+
+### Comma-separated Fields
+
+| Description   |                                        |
+|---------------|----------------------------------------|
+| $PMAG         | Record identifier                      |
+| millis() timestamp | Time of sample in milliseconds    |
+| X-mag         | Calibrated magnetic field X, in µT     |
+| Y-mag         | Calibrated magnetic field Y, in µT     |
+| Z-mag         | Calibrated magnetic field Z, in µT     |
+
+Earth's magnetic field magnitude is typically 25–65 µT.
+
+### $PMAG Example
+
+`$PMAG,13925127,23.50,-12.30,45.60`
+
+## $PRMG Record (USB Calibration Streaming)
+
+This record streams raw magnetometer readings during calibration mode (BTN2 short press with USB connected). Values are SET/RESET corrected but NOT hard/soft-iron calibrated. Used by the Python calibration tool (`mag_cal.py`) to collect samples for ellipsoid fitting.
+
+### Comma-separated Fields
+
+| Description   |                                        |
+|---------------|----------------------------------------|
+| $PRMG         | Record identifier                      |
+| millis() timestamp | Time of sample in milliseconds (since boot) |
+| raw X         | Raw X count, signed 18-bit (16384 counts/Gauss) |
+| raw Y         | Raw Y count, signed 18-bit (16384 counts/Gauss) |
+| raw Z         | Raw Z count, signed 18-bit (16384 counts/Gauss) |
+| temperature   | Die temperature in degrees Celsius     |
+
+### $PRMG Example
+
+`$PRMG,13925127,8192,-4096,12288,25.3`
+
+## $PCMD / $PRSP Records (USB Command Protocol)
+
+These records implement a bidirectional command/response protocol over the USB CDC-ACM interface. Commands are only accepted during magnetometer calibration streaming mode.
+
+### Command Format (Host → Device)
+
+`$PCMD,<verb>[,<arg1>,<arg2>,...]*HH\r\n`
+
+### Response Format (Device → Host)
+
+`$PRSP,<verb>,<result>[,<data>,...]*HH\r\n`
+
+### Available Commands
+
+| Command   | Description                              |
+|-----------|------------------------------------------|
+| CAL_GET   | Read current NVM calibration data        |
+| CAL_SET   | Write calibration data to NVM (6 fields: offset_x, offset_y, offset_z, scale_x, scale_y, scale_z) |
+| MODE_GET  | Read current mag_mode setting            |
+| MODE_SET  | Set mag_mode (0=disabled, 1=factory, 2=NVM calibrated) |
+
+### $PCMD / $PRSP Examples
+
+`$PCMD,CAL_GET*27`
+`$PRSP,CAL_GET,1,-234,567,-89,32100,33200,31800*4F`
+
+`$PCMD,CAL_SET,-234,567,-89,32100,33200,31800*1A`
+`$PRSP,CAL_SET,OK*3B`
+
+`$PCMD,MODE_SET,2*5C`
+`$PRSP,MODE_SET,OK*2E`
+
 ## Sentence Reporting Rates
 
 Sensor records are written to the file at these rates:
@@ -179,5 +250,8 @@ Sensor records are written to the file at these rates:
 |  PENV            |       4 Hz    |
 |  PTH             | follows each GGA and VTG record |
 |  PST             | at each internal state change in the logger |
+|  PMAG            | 20 Hz (when mag enabled and logging) |
+|  PRMG            | 20 Hz (USB calibration streaming mode only) |
+|  PCMD / PRSP     | on-demand (USB calibration streaming mode only) |
 
 Valid for version 55/155 and later

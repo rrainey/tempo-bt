@@ -35,6 +35,7 @@ The tool outputs:
 
 import argparse
 import json
+import queue
 import struct
 import sys
 import threading
@@ -104,14 +105,15 @@ def find_tempo_port():
     return None
 
 
-def serial_reader_thread(port, baud, samples, stop_event):
-    """Background thread: read $PRMG sentences and append to samples list."""
-    try:
-        ser = serial.Serial(port, baud, timeout=1)
-    except serial.SerialException as e:
-        print(f"ERROR: Could not open {port}: {e}")
-        return
+def serial_reader_thread(ser, samples, stop_event, response_queue):
+    """Background thread: read lines, route $PRMG to samples and $PRSP to response_queue.
 
+    Args:
+        ser: open serial.Serial object (caller manages open/close)
+        samples: list to append parsed $PRMG tuples
+        stop_event: threading.Event to signal shutdown
+        response_queue: queue.Queue for $PRSP response lines
+    """
     while not stop_event.is_set():
         try:
             line = ser.readline().decode("ascii", errors="ignore").strip()
@@ -119,11 +121,91 @@ def serial_reader_thread(port, baud, samples, stop_event):
             break
         if not line:
             continue
-        result = parse_prmg(line)
-        if result is not None:
-            samples.append(result)
+        if line.startswith("$PRSP"):
+            response_queue.put(line)
+        else:
+            result = parse_prmg(line)
+            if result is not None:
+                samples.append(result)
 
-    ser.close()
+
+def send_command(ser, response_queue, cmd_body, timeout=3.0):
+    """Send a $PCMD sentence and wait for the $PRSP response.
+
+    Args:
+        ser: open serial.Serial object
+        response_queue: queue.Queue receiving $PRSP lines from reader thread
+        cmd_body: command content after "$PCMD," (e.g., "CAL_GET")
+        timeout: seconds to wait for response
+
+    Returns:
+        Parsed response body (between "$PRSP," and "*") or None on timeout.
+    """
+    # Build sentence with NMEA checksum
+    sentence = f"$PCMD,{cmd_body}"
+    checksum = 0
+    for c in sentence[1:]:  # skip '$'
+        checksum ^= ord(c)
+    full = f"{sentence}*{checksum:02X}\r\n"
+
+    # Drain any stale responses
+    while not response_queue.empty():
+        try:
+            response_queue.get_nowait()
+        except queue.Empty:
+            break
+
+    # Send
+    ser.write(full.encode("ascii"))
+
+    # Wait for response
+    try:
+        resp = response_queue.get(timeout=timeout)
+        if resp.startswith("$PRSP,"):
+            star = resp.rfind("*")
+            if star > 0:
+                return resp[6:star]
+            return resp[6:]
+        return resp
+    except queue.Empty:
+        return None
+
+
+def upload_calibration(ser, response_queue, cal):
+    """Upload calibration data to device and set mag_mode=2.
+
+    Returns (success: bool, messages: list[str]).
+    """
+    messages = []
+
+    # Send CAL_SET
+    cmd = (f"CAL_SET,{cal['offset_x']},{cal['offset_y']},{cal['offset_z']},"
+           f"{cal['scale_x']},{cal['scale_y']},{cal['scale_z']}")
+    resp = send_command(ser, response_queue, cmd)
+    if resp is None:
+        messages.append("ERROR: No response (timeout)")
+        return False, messages
+    if resp != "CAL_SET,OK":
+        messages.append(f"ERROR: CAL_SET: {resp}")
+        return False, messages
+    messages.append("Calibration uploaded to NVM")
+
+    # Send MODE_SET,2
+    resp = send_command(ser, response_queue, "MODE_SET,2")
+    if resp is None:
+        messages.append("ERROR: No response (timeout)")
+        return False, messages
+    if resp != "MODE_SET,OK":
+        messages.append(f"ERROR: MODE_SET: {resp}")
+        return False, messages
+    messages.append("Mag mode set to 2 (NVM cal)")
+
+    # Verify with CAL_GET
+    resp = send_command(ser, response_queue, "CAL_GET")
+    if resp:
+        messages.append(f"Verify: {resp}")
+
+    return True, messages
 
 
 def run_calibration_app(port, baud, min_samples):
@@ -140,8 +222,16 @@ def run_calibration_app(port, baud, min_samples):
     from matplotlib.animation import FuncAnimation
     from matplotlib.widgets import Button
 
+    # Open serial port (kept open for entire session including upload)
+    try:
+        ser = serial.Serial(port, baud, timeout=1)
+    except serial.SerialException as e:
+        print(f"ERROR: Could not open {port}: {e}")
+        return None, []
+
     samples = []
     stop_event = threading.Event()
+    response_queue = queue.Queue()
     result = {}
 
     # ── main window ──────────────────────────────────────────────────
@@ -201,19 +291,12 @@ def run_calibration_app(port, baud, min_samples):
     phase = {"current": "waiting"}  # waiting -> collecting -> computing -> results
 
     # ── serial reader ────────────────────────────────────────────────
-    print(f"Opening {port} at {baud} baud...")
+    print(f"Opened {port} at {baud} baud")
     reader = threading.Thread(
         target=serial_reader_thread,
-        args=(port, baud, samples, stop_event),
+        args=(ser, samples, stop_event, response_queue),
         daemon=True)
     reader.start()
-
-    time.sleep(0.3)
-    if not reader.is_alive():
-        status_text.set_text("ERROR: Serial port\nfailed to open.\n\nClose window to exit.")
-        status_text.set_color("red")
-        plt.show()
-        return None, samples
 
     # ── button callback ──────────────────────────────────────────────
     def on_done(event):
@@ -231,8 +314,7 @@ def run_calibration_app(port, baud, min_samples):
         if phase["current"] == "computing":
             phase["current"] = "transitioning"
             anim.event_source.stop()
-            stop_event.set()
-            reader.join(timeout=3)
+            # Keep reader thread alive — needed for upload commands
             _transition_to_results()
             return ()
 
@@ -400,13 +482,41 @@ def run_calibration_app(port, baud, min_samples):
             f"Field magnitude:\n"
             f"  {cal['mean_magnitude_ut']:.1f}"
             f" +/- {cal['std_magnitude_ut']:.2f} uT\n\n"
-            "Close window to export\n"
-            "results and exit."
+            "Click [Upload] to send\n"
+            "calibration to device.\n"
+            "Close window when done."
         )
         ax_info.text(0.05, 0.98, summary,
                      transform=ax_info.transAxes,
                      fontsize=9, fontfamily="monospace",
                      verticalalignment="top")
+
+        # Upload status text (below summary)
+        upload_text = ax_info.text(
+            0.05, 0.05, "",
+            transform=ax_info.transAxes,
+            fontsize=8, fontfamily="monospace",
+            verticalalignment="bottom")
+
+        # Upload to Device button
+        ax_upload = fig.add_axes([0.03, 0.02, 0.18, 0.06])
+        btn_upload = Button(ax_upload, "Upload to Device",
+                            color="#dddddd", hovercolor="#90EE90")
+
+        def on_upload(event):
+            btn_upload.label.set_text("Uploading...")
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+
+            success, msgs = upload_calibration(ser, response_queue, cal)
+
+            upload_text.set_text("\n".join(msgs))
+            upload_text.set_color("green" if success else "red")
+            btn_upload.label.set_text("Done!" if success else "Failed")
+            btn_upload.color = "#90EE90" if success else "#FFB0B0"
+            fig.canvas.draw()
+
+        btn_upload.on_clicked(on_upload)
 
         fig.suptitle(
             f"Calibration: {cal['num_samples']} samples, "
@@ -425,10 +535,11 @@ def run_calibration_app(port, baud, min_samples):
     except KeyboardInterrupt:
         pass
 
-    # Ensure serial reader is stopped
+    # Shut down serial reader and close port
     stop_event.set()
     if reader.is_alive():
         reader.join(timeout=3)
+    ser.close()
 
     print(f"\nCollection complete: {len(samples)} samples")
     return result.get("cal"), samples

@@ -3,7 +3,9 @@
  *
  * Tempo-BT V1 - USB CDC-ACM TTY Service
  *
- * Provides NMEA sentence output over USB serial for ground testing.
+ * Provides bidirectional NMEA communication over USB serial.
+ * TX: interrupt-driven ring buffer for streaming output.
+ * RX: line accumulation in ISR, dispatch via system workqueue.
  */
 
 #ifndef SERVICES_USB_TTY_H
@@ -68,5 +70,23 @@ void usb_tty_close(void);
  */
 typedef void (*usb_tty_disconnect_cb_t)(void);
 void usb_tty_register_disconnect_callback(usb_tty_disconnect_cb_t callback);
+
+/**
+ * @brief Callback type for received lines
+ *
+ * Called from system workqueue context (not ISR) when a complete
+ * line (terminated by \n or \r\n) is received over USB.
+ *
+ * @param line  Null-terminated line (CRLF stripped)
+ * @param len   Length of the line
+ */
+typedef void (*usb_tty_rx_callback_t)(const char *line, size_t len);
+
+/**
+ * @brief Register callback for received lines
+ *
+ * @param callback  Function to call when a complete line is received
+ */
+void usb_tty_register_rx_callback(usb_tty_rx_callback_t callback);
 
 #endif /* SERVICES_USB_TTY_H */

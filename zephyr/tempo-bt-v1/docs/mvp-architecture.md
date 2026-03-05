@@ -95,7 +95,7 @@ tempo-bt/
 - ✓ ICM42688 IMU (200Hz FIFO, filtered accel magnitude for freefall detection)
 - ✓ Flight phase detection (takeoff, freefall, landing)
 - ✓ USB CDC-ACM TTY output (ground testing via Button 1 / BTN2)
-- ✗ MMC5983MA magnetometer (not integrated)
+- ✓ MMC5983MA magnetometer (calibration via USB, AHRS integration, NVM persistence)
 
 ```mermaid
 flowchart TB
@@ -235,8 +235,10 @@ flowchart TB
 ### 4.5 `orientation` + `fusion`
 
 * **Fusion AHRS algorithm** (based on xioTechnologies/Fusion library)
-* IMU-only operation (no magnetometer)
+* IMU + magnetometer operation when `mag_mode > 0` and calibration is valid
+* Falls back to IMU-only (gyro + accel) when magnetometer is disabled or unavailable
 * Outputs quaternion orientation updated from IMU samples
+* Magnetometer data supplied via `mag_read_fusion()` with coordinate frame rotation to match IMU axes
 * Configurable gain and acceleration rejection thresholds
 
 ### 4.6 `aggregator`
@@ -352,17 +354,55 @@ Used for multi-device synchronized testing via GNSS PPS signal.
 ### 4.12 `usb_tty` (conditional: `CONFIG_USB_TTY_OUTPUT`)
 
 * **USB CDC-ACM** virtual UART over the nRF5340's built-in USB peripheral
+* **Bidirectional**: TX ring buffer for non-blocking output + RX line accumulation for host commands
 * **Ground test mode**: streams the same NMEA sentence data that normally goes to SD card
+* **Mag calibration mode**: streams `$PRMG` sentences and accepts `$PCMD` commands (see `usb_cmd`)
 * **Interrupt-driven TX** with 4KB ring buffer for non-blocking writes
+* **Interrupt-driven RX**: ISR accumulates bytes into 128-byte line buffer; on `\n`, copies to second buffer and submits `k_work` for workqueue dispatch
 * **Connection detection**: checks DTR line control first, falls back to USB configured state (many Windows terminals don't assert DTR)
 * **Disconnect detection**: polls DTR while open; also monitors USB stack status callback (`USB_DC_DISCONNECTED`/`USB_DC_SUSPEND`)
-* **Disconnect notification**: fires registered callback via `k_work` (not from ISR context) so logger can safely stop
+* **Disconnect notification**: fires registered callback via `k_work` (not from ISR context) so caller can safely stop
 * **API**:
   * `usb_tty_init()` — enables USB device stack, called once at boot
   * `usb_tty_is_connected()` — checks if a USB host is present
   * `usb_tty_open()` / `usb_tty_close()` — session lifecycle
   * `usb_tty_output_line()` — matches `aggregator_output_callback_t` signature
   * `usb_tty_register_disconnect_callback()` — DTR-drop / USB-disconnect notification
+  * `usb_tty_register_rx_callback()` — register line-received callback (dispatched from workqueue)
+
+### 4.13 `mag_mmc5983ma` (conditional: `CONFIG_MMC5983MA`)
+
+* **MMC5983MA magnetometer driver + service** on I2C bus
+* **Single-shot reads** with automatic SET/RESET demagnetization cycle for offset cancellation
+* **Calibration data** (`mag_calibration_t`):
+  * Offsets: `offset_x`, `offset_y`, `offset_z` (int32_t, raw LSB units)
+  * Scales: `scale_x`, `scale_y`, `scale_z` (uint16_t, Q1.15 fixed-point, 32768 = 1.0)
+  * `valid` flag
+* **NVS persistence**: calibration stored under `mag/cal` settings key; loaded at boot, saved via `mag_cal_save()`
+* **Coordinate frame rotation**: `mag_read_fusion()` rotates raw readings to match IMU axis convention for AHRS integration
+* **Calibration data management API**:
+  * `mag_cal_get()` / `mag_cal_set()` — read/write in-memory calibration
+  * `mag_cal_save()` / `mag_cal_load()` — NVS persistence
+  * `mag_cal_clear()` — reset to uncalibrated defaults
+* **`mag_read_fusion()`** — returns calibrated, axis-rotated magnetometer vector for orientation service
+
+### 4.14 `usb_cmd` (conditional: `CONFIG_USB_TTY_OUTPUT`)
+
+* **NMEA-style command/response protocol** over USB CDC-ACM
+* **Active only during mag calibration streaming mode** — gated by `usb_cmd_set_active(bool)`
+* **Command format**: `$PCMD,<verb>[,args]*HH\r\n`
+* **Response format**: `$PRSP,<verb>,<result>[,data]*HH\r\n`
+* **Checksum validation**: NMEA XOR checksum verified on all incoming commands
+* **Commands**:
+
+| Command | Host → Device | Device → Host |
+|---------|--------------|---------------|
+| CAL_GET | `$PCMD,CAL_GET*HH` | `$PRSP,CAL_GET,<valid>,<ox>,<oy>,<oz>,<sx>,<sy>,<sz>*HH` |
+| CAL_SET | `$PCMD,CAL_SET,<ox>,<oy>,<oz>,<sx>,<sy>,<sz>*HH` | `$PRSP,CAL_SET,OK*HH` or `$PRSP,CAL_SET,ERR,<code>*HH` |
+| MODE_GET | `$PCMD,MODE_GET*HH` | `$PRSP,MODE_GET,<mode>*HH` |
+| MODE_SET | `$PCMD,MODE_SET,<mode>*HH` | `$PRSP,MODE_SET,OK*HH` or `$PRSP,MODE_SET,ERR,<code>*HH` |
+
+* **Processing context**: RX callback registered with `usb_tty`; commands dispatched from system workqueue (safe for NVS flash writes)
 
 ---
 
@@ -440,6 +480,7 @@ stateDiagram-v2
 
 - **Button 0 / BTN1 long press** (2 seconds): Toggle IDLE ↔ ARMED
 - **Button 0 / BTN1 short press**: Start logging (when ARMED) or stop logging (when LOGGING/JUMPED)
+- **Button 1 / BTN2 short press**: Toggle magnetometer calibration streaming mode (requires USB host); streams `$PRMG` at 20 Hz and accepts `$PCMD` commands
 - **Button 1 / BTN2 long press** (2 seconds): Start USB TTY logging (when IDLE or ARMED, requires USB host); stop logging (when LOGGING/JUMPED, works for both USB and SD modes)
 
 **Automatic Flight Phase Detection (executive function @ 250ms):**
@@ -480,6 +521,10 @@ Uses **NMEA-style** `$Pxxx` proprietary sentences with checksums.
 | `$GxGGA` | 1 Hz or 10 Hz| GNSS fix (passthrough) |
 | `$GxVTG` | 1 Hz or 10 Hz| GNSS velocity (passthrough) |
 | `$GxRMC` | 1 Hz or 10 Hz| GNSS date/time/position/velocity (passthrough, 1 Hz mode only) |
+| `$PMAG` | 20 Hz | Calibrated magnetometer (x,y,z in µT) - when mag enabled and logging |
+| `$PRMG` | 20 Hz | Raw magnetometer (x,y,z LSB) - USB calibration streaming only |
+| `$PCMD` | Host→Device | USB command (CAL_GET, CAL_SET, MODE_GET, MODE_SET) |
+| `$PRSP` | Device→Host | USB command response |
 
 ### Checksum Format
 
@@ -524,8 +569,16 @@ All sentences end with `*HH\r\n` where HH is XOR checksum of characters between 
   - Landing detection (sustained low vertical activity)
   - Session abort (6 min timeout in LOGGING without jump)
 
+- ✓ **MMC5983MA magnetometer**:
+  - Single-shot reads with SET/RESET demagnetization
+  - Calibration via USB streaming (`$PRMG`) + Python tool (`mag_cal.py`)
+  - NVS persistence of calibration data (`mag/cal` settings key)
+  - USB command protocol (`$PCMD`/`$PRSP`) for cal upload and mag_mode control
+  - AHRS integration via `mag_read_fusion()` (coordinate-frame rotated)
+  - `mag_mode` setting: 0=disabled, 1=factory cal, 2=NVM cal
+
 ### Not Working / Pending
-- ✗ MMC5983MA magnetometer (not integrated)
+- (none currently)
 
 ---
 

@@ -3,8 +3,9 @@
  *
  * Tempo-BT V1 - USB CDC-ACM TTY Service
  *
- * Streams aggregator output over USB serial for ground testing.
- * Uses interrupt-driven TX with a ring buffer for non-blocking writes.
+ * Bidirectional USB serial for ground testing and calibration.
+ * TX: interrupt-driven ring buffer for non-blocking writes.
+ * RX: ISR line accumulation, dispatched via system workqueue.
  */
 
 #include <zephyr/kernel.h>
@@ -13,12 +14,14 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/sys/ring_buffer.h>
+#include <string.h>
 
 #include "services/usb_tty.h"
 
 LOG_MODULE_REGISTER(usb_tty, LOG_LEVEL_INF);
 
 #define USB_TTY_RING_SIZE 4096
+#define USB_TTY_RX_LINE_SIZE 128
 
 /* CDC-ACM device from devicetree */
 static const struct device *cdc_dev = DEVICE_DT_GET(DT_NODELABEL(cdc_acm_uart0));
@@ -33,6 +36,16 @@ static usb_tty_disconnect_cb_t disconnect_cb;
 /* TX ring buffer */
 RING_BUF_DECLARE(tx_ring, USB_TTY_RING_SIZE);
 
+/* RX line accumulation (ISR writes rx_line_buf, work handler reads rx_complete_buf) */
+static char rx_line_buf[USB_TTY_RX_LINE_SIZE];
+static char rx_complete_buf[USB_TTY_RX_LINE_SIZE];
+static size_t rx_pos;
+static size_t rx_complete_len;
+static usb_tty_rx_callback_t rx_callback;
+
+static void rx_line_work_handler(struct k_work *work);
+static K_WORK_DEFINE(rx_line_work, rx_line_work_handler);
+
 /* Work item for disconnect notification — cannot call logger_stop from ISR */
 static void disconnect_work_handler(struct k_work *work);
 static K_WORK_DEFINE(disconnect_work, disconnect_work_handler);
@@ -44,7 +57,20 @@ static K_WORK_DELAYABLE_DEFINE(dtr_poll_work, dtr_poll_handler);
 #define DTR_POLL_INTERVAL_MS 250
 
 /*
- * TX interrupt callback — drains the ring buffer into the CDC-ACM FIFO.
+ * RX line work handler — called from system workqueue when a complete
+ * line has been accumulated by the ISR.
+ */
+static void rx_line_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (rx_callback && rx_complete_len > 0) {
+        rx_callback(rx_complete_buf, rx_complete_len);
+    }
+}
+
+/*
+ * UART interrupt callback — handles both TX drain and RX line accumulation.
  */
 static void uart_irq_callback(const struct device *dev, void *user_data)
 {
@@ -54,6 +80,7 @@ static void uart_irq_callback(const struct device *dev, void *user_data)
         return;
     }
 
+    /* TX: drain ring buffer into CDC-ACM FIFO */
     if (uart_irq_tx_ready(dev)) {
         uint8_t *data;
         uint32_t len;
@@ -69,6 +96,32 @@ static void uart_irq_callback(const struct device *dev, void *user_data)
         } else {
             /* Ring buffer empty — disable TX interrupt */
             uart_irq_tx_disable(dev);
+        }
+    }
+
+    /* RX: accumulate bytes into line buffer */
+    if (uart_irq_rx_ready(dev)) {
+        uint8_t byte;
+
+        while (uart_fifo_read(dev, &byte, 1) == 1) {
+            if (byte == '\n') {
+                /* Complete line received */
+                rx_line_buf[rx_pos] = '\0';
+                /* Strip trailing \r */
+                if (rx_pos > 0 && rx_line_buf[rx_pos - 1] == '\r') {
+                    rx_line_buf[rx_pos - 1] = '\0';
+                    rx_pos--;
+                }
+                if (rx_pos > 0 && rx_callback) {
+                    memcpy(rx_complete_buf, rx_line_buf, rx_pos + 1);
+                    rx_complete_len = rx_pos;
+                    k_work_submit(&rx_line_work);
+                }
+                rx_pos = 0;
+            } else if (rx_pos < sizeof(rx_line_buf) - 1) {
+                rx_line_buf[rx_pos++] = byte;
+            }
+            /* else: overflow — discard byte */
         }
     }
 }
@@ -195,11 +248,15 @@ int usb_tty_open(void)
         return -ENOTCONN;
     }
 
-    /* Reset ring buffer */
+    /* Reset ring buffer and RX state */
     ring_buf_reset(&tx_ring);
+    rx_pos = 0;
 
     dtr_state = true;
     tty_open = true;
+
+    /* Enable RX interrupts for incoming commands */
+    uart_irq_rx_enable(cdc_dev);
 
     /* Start DTR polling for disconnect detection */
     k_work_reschedule(&dtr_poll_work, K_MSEC(DTR_POLL_INTERVAL_MS));
@@ -231,11 +288,13 @@ void usb_tty_close(void)
     /* Cancel DTR polling */
     k_work_cancel_delayable(&dtr_poll_work);
 
-    /* Disable TX interrupts */
+    /* Disable TX and RX interrupts */
     uart_irq_tx_disable(cdc_dev);
+    uart_irq_rx_disable(cdc_dev);
 
-    /* Drain any remaining data (best-effort) */
+    /* Reset buffers */
     ring_buf_reset(&tx_ring);
+    rx_pos = 0;
 
     LOG_INF("USB TTY closed");
 }
@@ -243,4 +302,9 @@ void usb_tty_close(void)
 void usb_tty_register_disconnect_callback(usb_tty_disconnect_cb_t callback)
 {
     disconnect_cb = callback;
+}
+
+void usb_tty_register_rx_callback(usb_tty_rx_callback_t callback)
+{
+    rx_callback = callback;
 }

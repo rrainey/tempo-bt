@@ -71,6 +71,7 @@ target_include_directories_ifdef(CONFIG_MMC5983MA app PRIVATE
 # USB CDC-ACM TTY service (optional)
 target_sources_ifdef(CONFIG_USB_TTY_OUTPUT app PRIVATE
     src/services/usb_tty.c
+    src/services/usb_cmd.c
 )
 
 # Utility sources
