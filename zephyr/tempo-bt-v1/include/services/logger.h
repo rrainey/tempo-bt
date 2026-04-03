@@ -53,10 +53,12 @@ int logger_init(const logger_config_t *config);
 
 /**
  * @brief Start a new logging session, enter LOGGING state
- * 
+ *
+ * @param reason Human-readable reason for starting (e.g. "manual_start",
+ *               "takeoff_detected", "test_alarm"). Logged in state-change record.
  * @return 0 on success, negative error code on failure
  */
-int logger_start(void);
+int logger_start(const char *reason);
 
 #ifdef CONFIG_USB_TTY_OUTPUT
 /**

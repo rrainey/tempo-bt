@@ -68,6 +68,15 @@ static struct k_work_delayable button0_work;
 static struct k_work button0_action_work;  /* For logger start/stop (can't run in ISR) */
 static int64_t button0_press_time;
 static bool button0_pending_start;  /* true = start, false = stop */
+
+/*
+ * Dedicated work queue for button actions that call logger_start/stop.
+ * The system work queue stack (2KB) is too small for FAT filesystem I/O.
+ */
+#define BUTTON_WQ_STACK_SIZE 3072
+#define BUTTON_WQ_PRIORITY   5
+static K_THREAD_STACK_DEFINE(button_wq_stack, BUTTON_WQ_STACK_SIZE);
+static struct k_work_q button_workq;
 #endif
 
 #if DT_NODE_HAS_STATUS(SW1_NODE, okay)
@@ -186,7 +195,7 @@ static void button0_work_handler(struct k_work *work)
             logger_state_t state = logger_get_state();
             if (state == LOGGER_STATE_ARMED) {
                 button0_pending_start = true;
-                k_work_submit(&button0_action_work);
+                k_work_submit_to_queue(&button_workq, &button0_action_work);
             }
         }
     }
@@ -198,7 +207,7 @@ static void button0_action_handler(struct k_work *work)
     ARG_UNUSED(work);
 
     if (button0_pending_start) {
-        int ret = logger_start();
+        int ret = logger_start("manual_start");
         if (ret == 0) {
             /* Update LED to reflect new logging state */
             update_led_for_state(logger_get_state());
@@ -254,7 +263,7 @@ static void button1_work_handler(struct k_work *work)
 
         if (press_duration >= BUTTON_LONG_PRESS_MS) {
             LOG_INF("Button 1 long press detected");
-            k_work_submit(&button1_action_work);
+            k_work_submit_to_queue(&button_workq, &button1_action_work);
         }
     }
 }
@@ -313,7 +322,7 @@ static void button1_isr(const struct device *dev, struct gpio_callback *cb,
             if (mag_cal_streaming ||
                 state == LOGGER_STATE_IDLE ||
                 state == LOGGER_STATE_ARMED) {
-                k_work_submit(&button1_short_press_work);
+                k_work_submit_to_queue(&button_workq, &button1_short_press_work);
             }
 #endif
         }
@@ -360,6 +369,12 @@ int buttons_init(void)
     
     k_work_init_delayable(&button0_work, button0_work_handler);
     k_work_init(&button0_action_work, button0_action_handler);
+
+    /* Start dedicated work queue for button actions (needs larger stack for FAT I/O) */
+    k_work_queue_init(&button_workq);
+    k_work_queue_start(&button_workq, button_wq_stack,
+                       K_THREAD_STACK_SIZEOF(button_wq_stack),
+                       BUTTON_WQ_PRIORITY, NULL);
 
     gpio_init_callback(&button0_cb_data,
                        button0_isr,
@@ -408,14 +423,14 @@ static void update_led_for_state(logger_state_t state)
     switch (state) {
     case LOGGER_STATE_IDLE:
         /* Blue slow blink for idle */
-        set_color_led_state(RGB_ORANGE, true);
-        LOG_INF("LED: Orange (idle)");
+        set_color_led_state(RGB_BLUE, true);
+        LOG_INF("LED: Blue (idle)");
         break;
 
     case LOGGER_STATE_ARMED:
-        /* Orange slow blink for armed */
-        set_color_led_state(RGB_BLUE, true);
-        LOG_INF("LED: Blue (armed)");
+        /* No blink for armed */
+        set_color_led_state(RGB_BLACK, true);
+        LOG_INF("LED: Off (armed)");
         break;
 
     case LOGGER_STATE_LOGGING:
@@ -425,9 +440,9 @@ static void update_led_for_state(logger_state_t state)
         break;
 
     case LOGGER_STATE_JUMPED:
-        /* Cyan slow blink for active jump (freefall/canopy) */
-        set_color_led_state(RGB_CYAN, true);
-        LOG_INF("LED: Cyan (jumped)");
+        /* Orange slow blink for active jump (freefall/canopy) */
+        set_color_led_state(RGB_ORANGE, true);
+        LOG_INF("LED: Orange (jumped)");
         break;
 
     case LOGGER_STATE_ERROR:
@@ -490,7 +505,7 @@ static void button0_work_handler_with_led(struct k_work *work)
             set_color_led_state(RGB_GREEN, true);  /* Armed */
         } else if (state == LOGGER_STATE_ARMED) {
             logger_disarm();
-            set_color_led_state(RGB_BLUE, true);   /* Back to idle */
+            set_color_led_state(RGB_BLACK, true);   /* Back to idle */
         }
     }
 }

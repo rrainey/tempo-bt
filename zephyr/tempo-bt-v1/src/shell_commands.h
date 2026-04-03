@@ -19,7 +19,7 @@ static int cmd_log_start(const struct shell *sh, size_t argc, char **argv)
     ARG_UNUSED(argc);
     ARG_UNUSED(argv);
     
-    int ret = logger_start();
+    int ret = logger_start("shell_commanded_start");
     if (ret == 0) {
         shell_print(sh, "Logging started");
     } else {

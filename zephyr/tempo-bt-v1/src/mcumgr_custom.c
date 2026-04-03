@@ -427,7 +427,7 @@ static int tempo_mgmt_logger_control(struct smp_streamer *ctxt)
     if (action_str.len == 5 && memcmp(action_str.value, "start", 5) == 0) {
         /* Start logging */
         if (current_state == LOGGER_STATE_ARMED) {
-            ret = logger_start();
+            ret = logger_start("ble_commanded_start");
             if (ret == 0) {
                 new_state = LOGGER_STATE_LOGGING;
                 started_via_ble = true;
@@ -436,7 +436,7 @@ static int tempo_mgmt_logger_control(struct smp_streamer *ctxt)
             /* Auto-arm then start */
             ret = logger_arm();
             if (ret == 0) {
-                ret = logger_start();
+                ret = logger_start("ble_commanded_start");
                 if (ret == 0) {
                     new_state = LOGGER_STATE_LOGGING;
                     started_via_ble = true;

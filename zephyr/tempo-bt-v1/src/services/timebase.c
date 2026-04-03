@@ -204,7 +204,7 @@ static void test_alarm_work_handler(struct k_work *work)
                 }
             }
 
-            ret = logger_start();
+            ret = logger_start("test_alarm");
             if (ret != 0) {
                 LOG_ERR("Test alarm: failed to start logger: %d", ret);
                 test_alarm_set_state(TEST_ALARM_IDLE);

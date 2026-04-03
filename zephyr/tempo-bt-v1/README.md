@@ -180,7 +180,8 @@ The RGB LED provides visual system status:
 
 | Color | Pattern | State |
 |-------|---------|-------|
-| Blue | Slow pulse | ARMED - Ready |
+| Blue | Slow Pulse | IDLE - not used in the current implementation |
+| Off | N/A | ARMED - Ready (green / red side LEDs indicate GNSS Fix State) |
 | Green | Slow pulse | Logging - waiting for aircraft exit |
 | Orange | Slow pulse | Logging - in freefall or under canopy |
 | White | Solid | File transfer active (not yet implemented) |

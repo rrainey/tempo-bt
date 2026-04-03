@@ -228,7 +228,7 @@ int logger_init(const logger_config_t *config)
     return 0;
 }
 
-int logger_start(void)
+int logger_start(const char *reason)
 {
     int ret;
     
@@ -303,7 +303,7 @@ int logger_start(void)
     /* Write state change to log */
     aggregator_write_state_change(state_to_string(old_state),
                                   state_to_string(LOGGER_STATE_LOGGING),
-                                  "manual_start");
+                                  reason);
     
     /* Emit event */
     app_event_t evt = {
@@ -837,7 +837,7 @@ void logger_baro_handler(const baro_sample_t *sample)
             if (climb_samples > (TAKEOFF_DETECT_DURATION_S * logger_state.config.env_rate_hz)) {
                 LOG_INF("Takeoff detected! Climb rate: %.1f m/s, AGL: %.1f m",
                         climb_rate, agl);
-                logger_start();
+                logger_start("takeoff_detected");
             }
         } else {
             climb_samples = 0;
@@ -928,7 +928,7 @@ static void executive_handle_armed_state(float climb_rate)
                     climb_rate, climb_rate * 196.85f);
 
             /* Transition to LOGGING state */
-            int ret = logger_start();
+            int ret = logger_start("takeoff_detected");
             if (ret != 0) {
                 LOG_ERR("Failed to start logging: %d", ret);
             }
