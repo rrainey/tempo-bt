@@ -112,83 +112,146 @@ uint32_t test_alarm_decrement_countdown(void)
 #define TEMPO_MGMT_ID_MAG_CAL_GET    10
 #define TEMPO_MGMT_ID_MAG_CAL_SET    11
 
-/* List callback context */
+/*
+ * Session listing
+ *
+ * A session key is "<YYYYMMDD>/<SESSIONID>" — the path of a session
+ * directory relative to /logs. Hosts reconstruct file paths from the key
+ * by convention (e.g. "/logs/<key>/flight.txt"); see create_session_directory()
+ * in logger.c for the layout.
+ */
+
+/* Bounds chosen so a full response fits CONFIG_MCUMGR_TRANSPORT_NETBUF_SIZE */
+#define TEMPO_SESSION_LIST_MAX_DATES     32
+#define TEMPO_SESSION_LIST_MAX_SESSIONS  64
+#define TEMPO_SESSION_DATE_NAME_LEN      16
+
+/* Strip the storage prefix so paths are relative to the logs root
+ * (backends report either /logs/... or /lfs/logs/...) */
+static const char *logs_rel_path(const char *path)
+{
+    if (strncmp(path, "/lfs/logs/", 10) == 0) {
+        return path + 10;
+    }
+    if (strncmp(path, "/logs/", 6) == 0) {
+        return path + 6;
+    }
+    return path;
+}
+
+struct date_collect_context {
+    char names[TEMPO_SESSION_LIST_MAX_DATES][TEMPO_SESSION_DATE_NAME_LEN];
+    int count;
+    bool overflow;
+};
+
+static int collect_date_dirs_callback(const char *path, bool is_dir, size_t size, void *ctx)
+{
+    struct date_collect_context *dates = (struct date_collect_context *)ctx;
+
+    ARG_UNUSED(size);
+
+    if (!is_dir) {
+        return 0;  /* Only date directories live at the top level */
+    }
+
+    if (dates->count >= TEMPO_SESSION_LIST_MAX_DATES) {
+        dates->overflow = true;
+        return 1;  /* Stop iteration */
+    }
+
+    strncpy(dates->names[dates->count], logs_rel_path(path),
+            TEMPO_SESSION_DATE_NAME_LEN - 1);
+    dates->names[dates->count][TEMPO_SESSION_DATE_NAME_LEN - 1] = '\0';
+    dates->count++;
+
+    return 0;  /* Continue */
+}
+
+/* Session-emit callback context */
 struct list_context {
     zcbor_state_t *zse;
     int count;
     bool error;
+    bool truncated;
 };
 
-
-static int list_callback(const char *path, bool is_dir, size_t size, void *ctx)
+static int emit_session_callback(const char *path, bool is_dir, size_t size, void *ctx)
 {
     struct list_context *context = (struct list_context *)ctx;
+
+    ARG_UNUSED(size);
 
     if (context->error) {
         return -1;  /* Stop on error */
     }
 
-    if (is_dir) {
-        /* Extract relative path - handle both /lfs/logs/ and /logs/ */
-        const char *rel_path = path;
-        if (strncmp(path, "/lfs/logs/", 10) == 0) {
-            rel_path = path + 10;
-        } else if (strncmp(path, "/logs/", 6) == 0) {
-            rel_path = path + 6;
-        }
-
-        /* Start session object */
-        bool ok = zcbor_map_start_encode(context->zse, 3) &&
-                  zcbor_tstr_put_lit(context->zse, "name") &&
-                  zcbor_tstr_put_term(context->zse, rel_path, 256) &&  /* Increased size */
-                  zcbor_tstr_put_lit(context->zse, "is_dir") &&
-                  zcbor_bool_put(context->zse, true) &&
-                  zcbor_tstr_put_lit(context->zse, "size") &&
-                  zcbor_uint32_put(context->zse, (uint32_t)size) &&
-                  zcbor_map_end_encode(context->zse, 3);
-
-        if (!ok) {
-            context->error = true;
-            return -1;  /* Stop on error */
-        }
-
-        context->count++;
+    if (!is_dir) {
+        return 0;  /* Session entries are directories */
     }
+
+    if (context->count >= TEMPO_SESSION_LIST_MAX_SESSIONS) {
+        context->truncated = true;
+        return 1;  /* Stop iteration */
+    }
+
+    /* Emit the session key: "<YYYYMMDD>/<SESSIONID>" */
+    bool ok = zcbor_map_start_encode(context->zse, 1) &&
+              zcbor_tstr_put_lit(context->zse, "name") &&
+              zcbor_tstr_put_term(context->zse, logs_rel_path(path), 64) &&
+              zcbor_map_end_encode(context->zse, 1);
+
+    if (!ok) {
+        context->error = true;
+        return -1;  /* Stop on error */
+    }
+
+    context->count++;
 
     return 0;  /* Continue */
 }
 
-/* List logging sessions */
+/* List logging sessions as "<YYYYMMDD>/<SESSIONID>" keys */
 static int tempo_mgmt_session_list(struct smp_streamer *ctxt)
 {
     zcbor_state_t *zse = ctxt->writer->zs;
+    struct date_collect_context dates = { .count = 0, .overflow = false };
     struct list_context list_ctx;
     bool ok;
 
-    /* Start map */
+    /* Pass 1: collect date directories under /logs (avoids holding two
+     * directories open at once while iterating) */
+    storage_list_dir("/logs", collect_date_dirs_callback, &dates);
+
     ok = zcbor_tstr_put_lit(zse, "sessions") &&
-         zcbor_list_start_encode(zse, 20);
-    
+         zcbor_list_start_encode(zse, TEMPO_SESSION_LIST_MAX_SESSIONS);
+
     if (!ok) {
         return MGMT_ERR_EMSGSIZE;
     }
 
-    /* Initialize list context */
     list_ctx.zse = zse;
     list_ctx.count = 0;
     list_ctx.error = false;
+    list_ctx.truncated = false;
 
-    /* List sessions from storage - use generic path */
-    storage_list_dir("/logs", list_callback, &list_ctx);
+    /* Pass 2: list session directories within each date directory */
+    for (int i = 0; i < dates.count && !list_ctx.truncated; i++) {
+        char date_path[32];
 
-    if (list_ctx.error) {
-        return MGMT_ERR_EMSGSIZE;
+        snprintf(date_path, sizeof(date_path), "/logs/%s", dates.names[i]);
+        storage_list_dir(date_path, emit_session_callback, &list_ctx);
+
+        if (list_ctx.error) {
+            return MGMT_ERR_EMSGSIZE;
+        }
     }
 
-    /* End sessions array and add count */
-    ok = zcbor_list_end_encode(zse, 20) &&
+    ok = zcbor_list_end_encode(zse, TEMPO_SESSION_LIST_MAX_SESSIONS) &&
          zcbor_tstr_put_lit(zse, "count") &&
-         zcbor_int32_put(zse, list_ctx.count);
+         zcbor_int32_put(zse, list_ctx.count) &&
+         zcbor_tstr_put_lit(zse, "truncated") &&
+         zcbor_bool_put(zse, list_ctx.truncated || dates.overflow);
 
     if (!ok) {
         return MGMT_ERR_EMSGSIZE;
