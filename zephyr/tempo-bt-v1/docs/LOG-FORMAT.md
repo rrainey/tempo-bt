@@ -1,212 +1,256 @@
-# Log File Format
+# Tempo-BT Log File Format
 
-A Dropkick log is an extended NMEA-sentence text file. It is composed of [NMEA 0183](https://en.wikipedia.org/wiki/NMEA_0183) standard GPS records, or "sentences" using NMEA terminology,
- interspersed with the application-specific sentences described below.
+A Tempo-BT log (`flight.txt`, one per logging session, stored at
+`/logs/<YYYYMMDD>/<SESSIONID>/` on the device's primary storage) is an extended
+NMEA-sentence text file: [NMEA 0183](https://en.wikipedia.org/wiki/NMEA_0183)
+standard GNSS sentences interspersed with the application-specific sentences
+described below. Lines are CRLF-terminated.
 
- While the Tempo-BT box is turned on, a new log file will be created when the device detects that aircraft carrying the skydiver has taken off.  Logging continues 
- until a short time after the jumper reaches the ground.
+A session begins when logging starts — by push-button (`manual_start`), by BLE
+command, or automatically when the device detects the aircraft climbing
+(`takeoff_detected`) — and ends on manual stop, BLE command, or automatically a
+short time after the jumper reaches the ground.
 
- ## Time bases
+This document describes the format emitted by **Tempo-BT firmware v1.x**
+(`$PVER` format versions 110 and later). The format descends from the earlier
+Dropkick logger; the legacy Dropkick format (versions 0xx) is documented in the
+Dropkick repository. A version-history table appears at the end of this
+document.
 
- Some NMEA sentences include a UTC timestamp computed by the GNSS receiver. A native clock in an Arduino application is the
- millis() system call.  It is a unsigned 32-bit value reflecting the number of milliseconds
- elapsed since boot time.  Both time values
- will appear in a log file.  These two timelines are designed to be correlated using information in a $PTH sentence, described below.
+## Time bases
+
+Some NMEA sentences include a UTC timestamp computed by the GNSS receiver. The
+device's native clock is its uptime in milliseconds (an unsigned 32-bit count
+since boot, written as "device-ms" below; the Dropkick heritage called this
+`millis()`). Both time values appear in a log file, and the two timelines are
+correlated using the `$PTH` sentence described below.
 
 ## NMEA Checksums
 
-As of version 55/155, all sentences end with a three character NMEA checksum sequence ("*HH", where HH is the hex representation of the checksum byte).  These  are omitted from the examples shown below for clarity.
+All sentences end with a three-character NMEA checksum sequence (`*HH`, where
+`HH` is the hex representation of the checksum byte). Checksums are omitted
+from most examples below for clarity.
+
+## GNSS Sentences
+
+The u-blox GNSS receiver contributes standard sentences with the `$GN` talker
+prefix:
+
+| Sentence | Rate | Notes |
+|----------|------|-------|
+| `$GNGGA` | 1 Hz normally, **10 Hz in jump mode** | position/fix; each GGA is immediately followed by a `$PTH` |
+| `$GNVTG` | 1 Hz normally, **10 Hz in jump mode** | course/speed over ground |
+| `$GNRMC` | 1 Hz (always; does **not** increase in jump mode) | carries the UTC **date** — the only sentence that does. Emitted since format version 112; **version-110 logs contain no RMC**, so tools must derive the date elsewhere (e.g. the session directory name). |
+| `$GNGSA` | *planned — not currently emitted* | DOP/active satellites |
 
 ## $PVER Record
 
-A single instance of this record appears as the first sentence of each log.  It documents
- the software version used to create the file. The app version is an integer version number; the "hundreds" digit is used to
- designate whether the file originated from a Dropkick(0) or the newer Tempo board(1). This is an imperfect scheme.  It will make for future issues
- with versioning semantics. I'll have to fix that with an updated version of this sentence some time later.
+A single instance appears as the first sentence of each log, documenting the
+firmware that created the file. The version number's "hundreds" digit
+designates the board family: 1xx = Tempo, 0xx = the legacy Dropkick. (An
+imperfect scheme, retained for compatibility.)
 
 ### Comma-separated Fields
 
- | Description   |                                        |
- |---------------|----------------------------------------|
-| $PVER         | Record identifier                      |
-| id string | ID of this app version   |
-| version number       | an integer version number of the application; a '1' in the decimal hundreds place indicates it was created by Tempo, not Dropkick        |
+| Description | |
+|-------------|--|
+| $PVER | Record identifier |
+| id string | human-readable firmware identification |
+| version number | integer format version; 1xx = Tempo |
 
-### Example 
+### Example
 
-`$PVER,"Dropkick, version 0.52",52`
+`$PVER,"Tempo V2 1.4.0 (fa93d6d-dirty)",114*72`
+
+## $PSFC Record
+
+Follows the `$PVER` sentence. Records the estimated surface altitude of the
+takeoff area, computed from static air pressure assuming a
+[standard atmosphere lapse rate](https://en.wikipedia.org/wiki/Atmospheric_pressure).
+Subtract this value from `$PENV` altitude reports to estimate height above
+ground level (AGL).
+
+### Comma-separated Fields
+
+| Description | |
+|-------------|--|
+| $PSFC | Record identifier |
+| estimated surface altitude | feet, MSL (reflects pressure sampled at the device) |
+
+### Example
+
+`$PSFC,650*19`
+
+## $PST Record
+
+Records logger state-machine transitions. Useful for isolating segments of the
+jump during analysis — in particular, the transition **to `JUMPED` marks
+freefall detection (exit)**.
+
+The logger states are `IDLE`, `ARMED`, `LOGGING`, `JUMPED`, and `POSTFLIGHT`.
+A session's first `$PST` is normally the transition into `LOGGING`; the reason
+field is free text (observed values include `manual_start`,
+`takeoff_detected`, `freefall_detected`, `manual_stop`).
+
+> Heritage note: Dropkick used a 3-field form (`$PST,<ms>,<newstate>`) with
+> states `WAIT/FLIGHT/JUMPING/LANDED1`. Tempo-BT has always used the 5-field
+> transition form below.
+
+### Comma-separated Fields
+
+| Description | |
+|-------------|--|
+| $PST | Record identifier |
+| device-ms timestamp | time of state change in milliseconds |
+| from state | state being left |
+| to state | state being entered |
+| reason | free-text trigger description |
+
+### Examples
+
+```
+$PST,1037,ARMED,LOGGING,takeoff_detected*63
+$PST,813987,LOGGING,JUMPED,freefall_detected*51
+$PST,1096343,JUMPED,IDLE,manual_stop*37
+```
 
 ## $PIMU Record
 
-### For Dropkick boards
-
-PIMU record logs sensor information from the [MPU6050 IMU IC](https://invensense.tdk.com/wp-content/uploads/2015/02/MPU-6000-Datasheet1.pdf).  The MPU6050 is mounted on the
-Dropkick PCB such that the positive X-Axis projects out the SD card slot, the positive Y-Axis projects out the face opposite the USB port, and the positive Z-Axis projects out the "top" of the enclosure.  Since the device might be carried by a skydiver in almost any orientation, it would be up to analysis software to discern the body orientation inferred by actual readings.
-
-### For Tempo boards
-
-The ICM42688-V IMU is installed on Tempo Boards. Values are reported in Case Axes (body axes), shown below.
+Logs inertial data from the ICM42688-V IMU, reported in Case Axes (body axes),
+shown below.
 
 ### Comma-separated Fields
 
-| Description   |                                        |
-|---------------|----------------------------------------|
-| $PIMU         | Record identifier                      |
-| millis() timestamp | Time of sample in milliseconds    |
-| X-accel       | expressed in meters per second squared          |
-| Y-accel       | expressed in meters per second squared          |
-| Z-accel       | expressed in meters per second  squared       |
-| X-rate       | raw X rotation rate; expressed in radians per second         |
-| Y-rate       | raw Y rotation rate; expressed in radians per second         |
-| Z-rate       | raw Z rotation rate; expressed in radians per second         |
-
-![Dropkick axes](images/imu-axes.png)
-Dropkick board Body Axes
+| Description | |
+|-------------|--|
+| $PIMU | Record identifier |
+| device-ms timestamp | time of sample in milliseconds |
+| X-accel | meters per second squared |
+| Y-accel | meters per second squared |
+| Z-accel | meters per second squared |
+| X-rate | rotation rate, radians per second |
+| Y-rate | rotation rate, radians per second |
+| Z-rate | rotation rate, radians per second |
 
 ![Tempo Frames](images/tempo-v1-frames.png)
-Template board Axes, including the Case (or Body) Axis definitions
+Tempo board axes, including the Case (or Body) Axis definitions
 
-## $PIM2 Record (Tempo/Tempo-BT devices only)
+### Example
 
-This is the real-time orientation of the jumper expressed as a [Quaternion](https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation).
+`$PIMU,1396,-1.21,9.73,-3.75,-0.0701,-0.0653,-0.0075*07`
 
-The application maintains this orientation quaternion using a 200Hz sample
-stream from the IMU. A startup value of [1,0,0,0] is used,
-and orientation quaternion is updated to reflect all changes in the body axes from
-that original orientation.
+## $PIM2 Record
 
-This raw orientation quaternion must be transformed into some world frame of reference - North-East-Down, for example - 
-in order for it to be useful in analysis of a jump.  I have a few approaches to this in mind, but it remains
-as future work in this project.
+The real-time orientation of the jumper expressed as a
+[quaternion](https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation).
+One `$PIM2` immediately follows each `$PIMU`.
+
+The application maintains this orientation quaternion from a 200 Hz sample
+stream inside the IMU pipeline (logged at the `$PIMU` rate). A startup value
+of [1,0,0,0] is used, and the quaternion accumulates all body-axis rotation
+from that original orientation. Transforming it into a world frame
+(North-East-Down, for example) remains analysis-side work.
 
 ### Comma-separated Fields
 
-| Description   |                                        |
-|---------------|----------------------------------------|
-| $PIM2         | Record identifier                      |
-| millis() timestamp | Time of sample in milliseconds    |
-| W       |    quaternion w component, non-dimensional      |
-| X      |    quaternion x component, non-dimensional        |
-| Y      |    quaternion y component, non-dimensional     |
-| Z     |   quaternion z component, non-dimensional   |
+| Description | |
+|-------------|--|
+| $PIM2 | Record identifier |
+| device-ms timestamp | time of sample in milliseconds |
+| W | quaternion w component, non-dimensional |
+| X | quaternion x component, non-dimensional |
+| Y | quaternion y component, non-dimensional |
+| Z | quaternion z component, non-dimensional |
 
-
-### $PIM2 Example
+### Example
 
 `$PIM2,13925127,1.0000,0.0000,0.0000,0.0000`
 
 ## $PENV Record
 
-This record logs pressure information captured from the 
-[BMP390 sensor IC](https://www.infineon.com/dgdl/Infineon-DPS310-DataSheet-v01_02-EN.pdf?fileId=5546d462576f34750157750826c42242) and a resistor ladder used to monitor the VBATT battery line voltage level.
+Logs static pressure from the
+[BMP390 sensor](https://www.bosch-sensortec.com/products/environmental-sensors/pressure-sensors/bmp390/)
+and a derived standard-day altitude.
 
 ### Comma-separated Fields
-| Description   |                                        |
-|---------------|----------------------------------------|
-| $PENV         | Record identifier                      |
-| millis() timestamp | Time of sample in milliseconds    |
-| static air  pressure       | expressed in hPa         |
-| estimated altitude | based on static air pressure reading assuming a Standard Day; expressed in feet, MSL   |
-| VBATT voltage      | battery voltage level (3.5V - 3.8V typ.); sampled once every 30 seconds; (not used on Tempo-BT)
-battery voltage isn't reported  on Tempo boards: the value will be set to -1    |
 
-### $PENV Example
+| Description | |
+|-------------|--|
+| $PENV | Record identifier |
+| device-ms timestamp | time of sample in milliseconds |
+| static air pressure | hPa |
+| estimated altitude | from static pressure assuming a Standard Day; feet, MSL |
+| VBATT voltage | **always -1.00 on Tempo-BT** (battery voltage is not monitored on V1 hardware; the field is retained for Dropkick compatibility) |
 
-`$PENV,13925040,984.62,791.18,3.79`
+### Example
+
+`$PENV,1286,987.85,701.05,-1.00*3A`
 
 ## $PTH Record
 
- A PTH record is used to correlate Arduino millis() timestamps with the GNSS computed time of day
-  clock information that appears in standard NMEA sentences.  A PTH record will appear immediately 
-  following each NMEA GGA or GGL record.  The timestamp present in the record reflects the millis() time at the arrival
-  of the first character of the NMEA record.
+Correlates device-ms timestamps with the GNSS UTC clock in standard NMEA
+sentences. **One `$PTH` immediately follows each `$GNGGA`**; its timestamp is
+the device-ms at the arrival of the first character of that GGA sentence.
+(`$PTH` follows the GGA only — not VTG or RMC.)
 
-### $PTH Example
+To convert a device-ms event time to UTC: take the GGA preceding the event,
+its paired `$PTH`, and compute `event_utc = gga_utc + (event_ms - pth_ms)`.
 
-`$PTH,13925296`
+### Example
 
-## $PSFC Record
+```
+$GNGGA,134316.00,3327.50347,N,09622.62352,W,1,12,0.59,258.0,M,-25.6,M,,*71
+$PTH,1364*60
+```
 
-This records the estimated surface altitude of the landing area. This value is currently computed directly from the static air pressure assuming a [standard air pressure
-lapse rate](https://en.wikipedia.org/wiki/Atmospheric_pressure).
+## $PMAG Record (devices with MMC5983MA magnetometer)
 
-This value can be subtracted from the altitude reports in $PENV sentences to obtain an estimated height above ground level (AGL)
-
-### Comma-separated Fields
-
-| Description   |                                        |
-|---------------|----------------------------------------|
-| $PSFC         | Record identifier                      |
-| estimated surface altitude | Expressed in feet, MSL. Technically speaking, this value reflects the pressure sampled at the device.   |
-
-
-### $PSFC Example
-
-`$PSFC,880`
-
-# $PST Record
-
-This record records application state changes. This internal state machine is used to
-identify when to start and stop logging of each jump. 
-
-The application defines WAIT, FLIGHT, JUMPING, and LANDED1 states.  This information might be useful to
-isolate specific segments of the jump during post-jump analysis.
+Logs calibrated magnetometer data. Only emitted when `mag_mode > 0` and
+calibration is valid. Values are in the device body-axis frame after hard/soft
+iron correction. Earth's magnetic field magnitude is typically 25–65 µT.
 
 ### Comma-separated Fields
 
-| Description   |                                        |
-|---------------|----------------------------------------|
-| $PSFC         | Record identifier                      |
-| millis() timestamp | Time of state change in milliseconds   |
-| New State | WAIT, FLIGHT, JUMPING, or LANDED1  |
+| Description | |
+|-------------|--|
+| $PMAG | Record identifier |
+| device-ms timestamp | time of sample in milliseconds |
+| X-mag | calibrated magnetic field X, µT |
+| Y-mag | calibrated magnetic field Y, µT |
+| Z-mag | calibrated magnetic field Z, µT |
 
-
-### $PST Example
-
-`$PST,1000,FLIGHT`
-
-## $PMAG Record (Tempo-BT devices with MMC5983MA)
-
-This record logs calibrated magnetometer data from the MMC5983MA. Only emitted when `mag_mode > 0` and calibration is valid. Values are in the device body axis frame after hard/soft iron correction.
-
-### Comma-separated Fields
-
-| Description   |                                        |
-|---------------|----------------------------------------|
-| $PMAG         | Record identifier                      |
-| millis() timestamp | Time of sample in milliseconds    |
-| X-mag         | Calibrated magnetic field X, in µT     |
-| Y-mag         | Calibrated magnetic field Y, in µT     |
-| Z-mag         | Calibrated magnetic field Z, in µT     |
-
-Earth's magnetic field magnitude is typically 25–65 µT.
-
-### $PMAG Example
+### Example
 
 `$PMAG,13925127,23.50,-12.30,45.60`
 
-## $PRMG Record (USB Calibration Streaming)
+## $PRMG Record (USB calibration streaming)
 
-This record streams raw magnetometer readings during calibration mode (BTN2 short press with USB connected). Values are SET/RESET corrected but NOT hard/soft-iron calibrated. Used by the Python calibration tool (`mag_cal.py`) to collect samples for ellipsoid fitting.
+Streams raw magnetometer readings during calibration mode (BTN2 short press
+with USB connected). Values are SET/RESET corrected but NOT hard/soft-iron
+calibrated. Used by the Python calibration tool (`mag_cal.py`) to collect
+samples for ellipsoid fitting. Appears on the USB CDC-ACM stream, not in log
+files.
 
 ### Comma-separated Fields
 
-| Description   |                                        |
-|---------------|----------------------------------------|
-| $PRMG         | Record identifier                      |
-| millis() timestamp | Time of sample in milliseconds (since boot) |
-| raw X         | Raw X count, signed 18-bit (16384 counts/Gauss) |
-| raw Y         | Raw Y count, signed 18-bit (16384 counts/Gauss) |
-| raw Z         | Raw Z count, signed 18-bit (16384 counts/Gauss) |
-| temperature   | Die temperature in degrees Celsius     |
+| Description | |
+|-------------|--|
+| $PRMG | Record identifier |
+| device-ms timestamp | milliseconds since boot |
+| raw X | raw X count, signed 18-bit (16384 counts/Gauss) |
+| raw Y | raw Y count, signed 18-bit (16384 counts/Gauss) |
+| raw Z | raw Z count, signed 18-bit (16384 counts/Gauss) |
+| temperature | die temperature, °C |
 
-### $PRMG Example
+### Example
 
 `$PRMG,13925127,8192,-4096,12288,25.3`
 
-## $PCMD / $PRSP Records (USB Command Protocol)
+## $PCMD / $PRSP Records (USB command protocol)
 
-These records implement a bidirectional command/response protocol over the USB CDC-ACM interface. Commands are only accepted during magnetometer calibration streaming mode.
+A bidirectional command/response protocol over the USB CDC-ACM interface.
+Commands are only accepted during magnetometer calibration streaming mode.
+These sentences do not appear in log files.
 
 ### Command Format (Host → Device)
 
@@ -218,40 +262,51 @@ These records implement a bidirectional command/response protocol over the USB C
 
 ### Available Commands
 
-| Command   | Description                              |
-|-----------|------------------------------------------|
-| CAL_GET   | Read current NVM calibration data        |
-| CAL_SET   | Write calibration data to NVM (6 fields: offset_x, offset_y, offset_z, scale_x, scale_y, scale_z) |
-| MODE_GET  | Read current mag_mode setting            |
-| MODE_SET  | Set mag_mode (0=disabled, 1=factory, 2=NVM calibrated) |
+| Command | Description |
+|---------|-------------|
+| CAL_GET | read current NVM calibration data |
+| CAL_SET | write calibration data to NVM (6 fields: offset_x, offset_y, offset_z, scale_x, scale_y, scale_z) |
+| MODE_GET | read current mag_mode setting |
+| MODE_SET | set mag_mode (0=disabled, 1=factory, 2=NVM calibrated) |
 
-### $PCMD / $PRSP Examples
+### Examples
 
-`$PCMD,CAL_GET*27`
-`$PRSP,CAL_GET,1,-234,567,-89,32100,33200,31800*4F`
+```
+$PCMD,CAL_GET*27
+$PRSP,CAL_GET,1,-234,567,-89,32100,33200,31800*4F
 
-`$PCMD,CAL_SET,-234,567,-89,32100,33200,31800*1A`
-`$PRSP,CAL_SET,OK*3B`
+$PCMD,CAL_SET,-234,567,-89,32100,33200,31800*1A
+$PRSP,CAL_SET,OK*3B
 
-`$PCMD,MODE_SET,2*5C`
-`$PRSP,MODE_SET,OK*2E`
+$PCMD,MODE_SET,2*5C
+$PRSP,MODE_SET,OK*2E
+```
 
 ## Sentence Reporting Rates
 
-Sensor records are written to the file at these rates:
+| Sentence Type | Reporting Rate |
+|:-------------:|:---------------|
+| PVER | first line of the log file |
+| PSFC | follows the PVER sentence |
+| GNGGA, GNVTG | 1 Hz normally; 10 Hz in jump mode |
+| GNRMC | 1 Hz (unchanged in jump mode); since version 112 |
+| GNGSA | planned — not currently emitted |
+| PTH | one, immediately following each GGA |
+| PIMU | 20 Hz |
+| PIM2 | follows each $PIMU sentence |
+| PENV | 4 Hz |
+| PST | at each logger state change |
+| PMAG | 20 Hz (when magnetometer enabled and logging) |
+| PRMG | 20 Hz (USB calibration streaming mode only; not in logs) |
+| PCMD / PRSP | on-demand (USB calibration streaming mode only; not in logs) |
 
-| Sentence Type      |  Reporting Rate |
-|:----------------:|:---------------------------------|
-|  PVER            | appears as the first line of a log file |
-|  PSFC            | follows the PVER sentence |
-|  GNSS position report  |  10 Hz in Jump mode, 1 Hz otherwise; GGA, VTG, RMC, GSA sentences |
-|  PIMU            |      50 Hz |
-|  PIM2            | follows each $PIMU sentence|
-|  PENV            |       4 Hz    |
-|  PTH             | follows each GGA and VTG record |
-|  PST             | at each internal state change in the logger |
-|  PMAG            | 20 Hz (when mag enabled and logging) |
-|  PRMG            | 20 Hz (USB calibration streaming mode only) |
-|  PCMD / PRSP     | on-demand (USB calibration streaming mode only) |
+## Format Version History
 
-Valid for version 55/155 and later
+| $PVER version | Firmware | Changes |
+|---------------|----------|---------|
+| 110 | Tempo V2 1.0.0 | Tempo-BT baseline: GGA/VTG + PTH, PIMU/PIM2 (20 Hz), PENV (battery always -1.00), PSFC, 5-field $PST. **No $GNRMC** — logs carry no in-band UTC date. |
+| 112 | Tempo V2 1.2.0 | Added `$GNRMC` (1 Hz), providing the UTC date in-band. |
+| 114 | Tempo V2 1.4.0+ | `$PMAG` available when `mag_mode > 0`; settings gained `mag_mode`. |
+
+*(Rates and behaviors above verified against real session logs from each
+version era, 2026-07-08.)*
