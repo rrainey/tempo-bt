@@ -12,16 +12,16 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(tempo-bt-v1)
 
 
-# Generate version header
+# Generate version header on every build: the header embeds the git commit
+# and build date, which can change without app.version being touched.
+# gen_version.py rewrites the file only when its content actually changes,
+# so dependent sources are not needlessly recompiled.
 set(VERSION_HEADER ${CMAKE_CURRENT_BINARY_DIR}/include/generated/app_version.h)
-add_custom_command(
-    OUTPUT ${VERSION_HEADER}
+add_custom_target(version_header
     COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_version.py ${VERSION_HEADER}
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/app.version
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    BYPRODUCTS ${VERSION_HEADER}
     COMMENT "Generating version header"
 )
-add_custom_target(version_header DEPENDS ${VERSION_HEADER})
 add_dependencies(app version_header)
 
 # NORDIC SDK APP START

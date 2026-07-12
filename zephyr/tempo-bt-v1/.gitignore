@@ -12,3 +12,6 @@ mag_cal.csv
 
 *.pyc
 __pycache__/
+
+# app_version.h is generated into the build directory; never commit a copy
+include/generated/app_version.h

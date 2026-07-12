@@ -4,6 +4,7 @@
  * Tempo-BT V1 - Custom mcumgr Handlers
  */
 
+#include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/mgmt/mcumgr/mgmt/mgmt.h>
@@ -21,6 +22,7 @@
 #include "services/mag.h"
 #include "config/settings.h"
 #include "ble_mcumgr.h"
+#include "generated/app_version.h"
 
 LOG_MODULE_REGISTER(mcumgr_custom, LOG_LEVEL_INF);
 
@@ -119,139 +121,183 @@ uint32_t test_alarm_decrement_countdown(void)
  * directory relative to /logs. Hosts reconstruct file paths from the key
  * by convention (e.g. "/logs/<key>/flight.txt"); see create_session_directory()
  * in logger.c for the layout.
+ *
+ * Output is paged: the request may carry an optional {"page": uint}
+ * (default 0) and the response reports "total_pages". Sessions are ordered
+ * by date directory descending (newest first), then by session directory
+ * name ascending within each date; both are plain character sorts.
  */
 
-/* Bounds chosen so a full response fits CONFIG_MCUMGR_TRANSPORT_NETBUF_SIZE */
-#define TEMPO_SESSION_LIST_MAX_DATES     32
-#define TEMPO_SESSION_LIST_MAX_SESSIONS  64
-#define TEMPO_SESSION_DATE_NAME_LEN      16
+/* One page must fit CONFIG_MCUMGR_TRANSPORT_NETBUF_SIZE */
+#define TEMPO_SESSION_LIST_PAGE_SIZE     64
+#define TEMPO_SESSION_LIST_MAX_DATES     64
+#define TEMPO_SESSION_LIST_MAX_PER_DATE  64
+#define TEMPO_SESSION_NAME_LEN           16
 
-/* Strip the storage prefix so paths are relative to the logs root
- * (backends report either /logs/... or /lfs/logs/...) */
-static const char *logs_rel_path(const char *path)
-{
-    if (strncmp(path, "/lfs/logs/", 10) == 0) {
-        return path + 10;
-    }
-    if (strncmp(path, "/logs/", 6) == 0) {
-        return path + 6;
-    }
-    return path;
-}
-
-struct date_collect_context {
-    char names[TEMPO_SESSION_LIST_MAX_DATES][TEMPO_SESSION_DATE_NAME_LEN];
+/* Directory-name collection: stores the final path element of each
+ * subdirectory into a caller-provided fixed-size array */
+struct name_collect_context {
+    char (*names)[TEMPO_SESSION_NAME_LEN];
+    int max;
     int count;
     bool overflow;
 };
 
-static int collect_date_dirs_callback(const char *path, bool is_dir, size_t size, void *ctx)
+static int collect_dir_names_callback(const char *path, bool is_dir, size_t size, void *ctx)
 {
-    struct date_collect_context *dates = (struct date_collect_context *)ctx;
+    struct name_collect_context *nc = (struct name_collect_context *)ctx;
+    const char *base;
 
     ARG_UNUSED(size);
 
     if (!is_dir) {
-        return 0;  /* Only date directories live at the top level */
+        return 0;  /* Sessions and dates are directories */
     }
 
-    if (dates->count >= TEMPO_SESSION_LIST_MAX_DATES) {
-        dates->overflow = true;
+    if (nc->count >= nc->max) {
+        nc->overflow = true;
         return 1;  /* Stop iteration */
     }
 
-    strncpy(dates->names[dates->count], logs_rel_path(path),
-            TEMPO_SESSION_DATE_NAME_LEN - 1);
-    dates->names[dates->count][TEMPO_SESSION_DATE_NAME_LEN - 1] = '\0';
-    dates->count++;
+    base = strrchr(path, '/');
+    base = (base != NULL) ? base + 1 : path;
+
+    strncpy(nc->names[nc->count], base, TEMPO_SESSION_NAME_LEN - 1);
+    nc->names[nc->count][TEMPO_SESSION_NAME_LEN - 1] = '\0';
+    nc->count++;
 
     return 0;  /* Continue */
 }
 
-/* Session-emit callback context */
-struct list_context {
-    zcbor_state_t *zse;
-    int count;
-    bool error;
-    bool truncated;
-};
-
-static int emit_session_callback(const char *path, bool is_dir, size_t size, void *ctx)
+/* Insertion sort of fixed-size name strings; small counts only */
+static void sort_names(char names[][TEMPO_SESSION_NAME_LEN], int count, bool descending)
 {
-    struct list_context *context = (struct list_context *)ctx;
+    for (int i = 1; i < count; i++) {
+        char tmp[TEMPO_SESSION_NAME_LEN];
+        int j = i - 1;
 
-    ARG_UNUSED(size);
+        memcpy(tmp, names[i], sizeof(tmp));
+        while (j >= 0) {
+            int cmp = strcmp(names[j], tmp);
 
-    if (context->error) {
-        return -1;  /* Stop on error */
+            if (descending ? (cmp >= 0) : (cmp <= 0)) {
+                break;
+            }
+            memcpy(names[j + 1], names[j], TEMPO_SESSION_NAME_LEN);
+            j--;
+        }
+        memcpy(names[j + 1], tmp, sizeof(tmp));
     }
-
-    if (!is_dir) {
-        return 0;  /* Session entries are directories */
-    }
-
-    if (context->count >= TEMPO_SESSION_LIST_MAX_SESSIONS) {
-        context->truncated = true;
-        return 1;  /* Stop iteration */
-    }
-
-    /* Emit the session key: "<YYYYMMDD>/<SESSIONID>" */
-    bool ok = zcbor_map_start_encode(context->zse, 1) &&
-              zcbor_tstr_put_lit(context->zse, "name") &&
-              zcbor_tstr_put_term(context->zse, logs_rel_path(path), 64) &&
-              zcbor_map_end_encode(context->zse, 1);
-
-    if (!ok) {
-        context->error = true;
-        return -1;  /* Stop on error */
-    }
-
-    context->count++;
-
-    return 0;  /* Continue */
 }
 
-/* List logging sessions as "<YYYYMMDD>/<SESSIONID>" keys */
+/* List logging sessions as "<YYYYMMDD>/<SESSIONID>" keys, one page at a time */
 static int tempo_mgmt_session_list(struct smp_streamer *ctxt)
 {
+    zcbor_state_t *zsd = ctxt->reader->zs;
     zcbor_state_t *zse = ctxt->writer->zs;
-    struct date_collect_context dates = { .count = 0, .overflow = false };
-    struct list_context list_ctx;
+
+    /* Too large for the mcumgr workqueue stack; safe as statics because
+     * mcumgr handlers are serialized on that single workqueue */
+    static char date_names[TEMPO_SESSION_LIST_MAX_DATES][TEMPO_SESSION_NAME_LEN];
+    static char session_names[TEMPO_SESSION_LIST_MAX_PER_DATE][TEMPO_SESSION_NAME_LEN];
+
+    uint32_t page = 0;
     bool ok;
 
-    /* Pass 1: collect date directories under /logs (avoids holding two
-     * directories open at once while iterating) */
-    storage_list_dir("/logs", collect_date_dirs_callback, &dates);
+    /* Optional request payload: {"page": uint}; absent/empty map = page 0 */
+    if (zcbor_map_start_decode(zsd)) {
+        struct zcbor_string key;
+
+        while (zcbor_tstr_decode(zsd, &key)) {
+            if (key.len == 4 && memcmp(key.value, "page", 4) == 0) {
+                ok = zcbor_uint32_decode(zsd, &page);
+            } else {
+                ok = zcbor_any_skip(zsd, NULL);
+            }
+            if (!ok) {
+                return MGMT_ERR_EINVAL;
+            }
+        }
+        zcbor_map_end_decode(zsd);
+    }
+
+    /* Pass 1: collect and sort date directories, newest first (avoids
+     * holding two directories open at once while iterating) */
+    struct name_collect_context dates = {
+        .names = date_names,
+        .max = TEMPO_SESSION_LIST_MAX_DATES,
+        .count = 0,
+        .overflow = false,
+    };
+
+    storage_list_dir("/logs", collect_dir_names_callback, &dates);
+    sort_names(date_names, dates.count, true);
 
     ok = zcbor_tstr_put_lit(zse, "sessions") &&
-         zcbor_list_start_encode(zse, TEMPO_SESSION_LIST_MAX_SESSIONS);
+         zcbor_list_start_encode(zse, TEMPO_SESSION_LIST_PAGE_SIZE);
 
     if (!ok) {
         return MGMT_ERR_EMSGSIZE;
     }
 
-    list_ctx.zse = zse;
-    list_ctx.count = 0;
-    list_ctx.error = false;
-    list_ctx.truncated = false;
+    /* Pass 2: per date directory, collect and sort session names ascending,
+     * then emit the entries that fall inside the requested page while
+     * counting every session for the totals */
+    const uint32_t first = page * TEMPO_SESSION_LIST_PAGE_SIZE;
+    uint32_t total = 0;
+    int emitted = 0;
+    bool truncated = dates.overflow;
 
-    /* Pass 2: list session directories within each date directory */
-    for (int i = 0; i < dates.count && !list_ctx.truncated; i++) {
+    for (int i = 0; i < dates.count; i++) {
+        struct name_collect_context sess = {
+            .names = session_names,
+            .max = TEMPO_SESSION_LIST_MAX_PER_DATE,
+            .count = 0,
+            .overflow = false,
+        };
         char date_path[32];
 
-        snprintf(date_path, sizeof(date_path), "/logs/%s", dates.names[i]);
-        storage_list_dir(date_path, emit_session_callback, &list_ctx);
+        snprintf(date_path, sizeof(date_path), "/logs/%s", date_names[i]);
+        storage_list_dir(date_path, collect_dir_names_callback, &sess);
+        sort_names(session_names, sess.count, false);
+        truncated = truncated || sess.overflow;
 
-        if (list_ctx.error) {
-            return MGMT_ERR_EMSGSIZE;
+        for (int j = 0; j < sess.count; j++, total++) {
+            char session_key[2 * TEMPO_SESSION_NAME_LEN];
+
+            if (total < first || emitted >= TEMPO_SESSION_LIST_PAGE_SIZE) {
+                continue;
+            }
+
+            snprintf(session_key, sizeof(session_key), "%s/%s",
+                     date_names[i], session_names[j]);
+
+            ok = zcbor_map_start_encode(zse, 1) &&
+                 zcbor_tstr_put_lit(zse, "name") &&
+                 zcbor_tstr_put_term(zse, session_key, sizeof(session_key)) &&
+                 zcbor_map_end_encode(zse, 1);
+
+            if (!ok) {
+                return MGMT_ERR_EMSGSIZE;
+            }
+            emitted++;
         }
     }
 
-    ok = zcbor_list_end_encode(zse, TEMPO_SESSION_LIST_MAX_SESSIONS) &&
+    uint32_t total_pages = (total + TEMPO_SESSION_LIST_PAGE_SIZE - 1) /
+                           TEMPO_SESSION_LIST_PAGE_SIZE;
+
+    ok = zcbor_list_end_encode(zse, TEMPO_SESSION_LIST_PAGE_SIZE) &&
          zcbor_tstr_put_lit(zse, "count") &&
-         zcbor_int32_put(zse, list_ctx.count) &&
+         zcbor_int32_put(zse, emitted) &&
+         zcbor_tstr_put_lit(zse, "page") &&
+         zcbor_uint32_put(zse, page) &&
+         zcbor_tstr_put_lit(zse, "total_pages") &&
+         zcbor_uint32_put(zse, total_pages) &&
+         zcbor_tstr_put_lit(zse, "total_sessions") &&
+         zcbor_uint32_put(zse, total) &&
          zcbor_tstr_put_lit(zse, "truncated") &&
-         zcbor_bool_put(zse, list_ctx.truncated || dates.overflow);
+         zcbor_bool_put(zse, truncated);
 
     if (!ok) {
         return MGMT_ERR_EMSGSIZE;
@@ -712,7 +758,8 @@ static int tempo_mgmt_settings_get(struct smp_streamer *ctxt)
     
     uint8_t mag_mode = app_settings_get_mag_mode();
 
-    /* Build response with all settings */
+    /* Build response with all settings plus firmware identification;
+     * version strings are truncated at 31 characters */
     bool ok = zcbor_tstr_put_lit(zse, "ble_name") &&
               zcbor_tstr_put_term(zse, ble_name, 32) &&
               zcbor_tstr_put_lit(zse, "pps_enabled") &&
@@ -722,14 +769,19 @@ static int tempo_mgmt_settings_get(struct smp_streamer *ctxt)
               zcbor_tstr_put_lit(zse, "log_backend") &&
               zcbor_tstr_put_term(zse, log_backend, 12) &&
               zcbor_tstr_put_lit(zse, "mag_mode") &&
-              zcbor_uint32_put(zse, mag_mode);
+              zcbor_uint32_put(zse, mag_mode) &&
+              zcbor_tstr_put_lit(zse, "fw_version") &&
+              zcbor_tstr_put_term(zse, APP_VERSION_STRING, 31) &&
+              zcbor_tstr_put_lit(zse, "git_commit") &&
+              zcbor_tstr_put_term(zse, APP_GIT_COMMIT, 31);
 
     if (!ok) {
         return MGMT_ERR_EMSGSIZE;
     }
 
-    LOG_INF("Settings get: ble_name=%s, pps=%d, pcb=0x%02X, backend=%s, mag_mode=%u",
-            ble_name, pps_enabled, pcb_variant, log_backend, mag_mode);
+    LOG_INF("Settings get: ble_name=%s, pps=%d, pcb=0x%02X, backend=%s, mag_mode=%u, fw=%s (%s)",
+            ble_name, pps_enabled, pcb_variant, log_backend, mag_mode,
+            APP_VERSION_STRING, APP_GIT_COMMIT);
     
     return 0;
 }

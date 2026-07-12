@@ -7,24 +7,30 @@ import sys
 import os
 import datetime
 
+# Application root (parent of the scripts/ directory), so results do not
+# depend on the caller's working directory
+APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 def get_git_info():
     """Get git commit hash and dirty status"""
     try:
         # Get commit hash
         commit = subprocess.check_output(
             ['git', 'rev-parse', '--short', 'HEAD'],
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            cwd=APP_ROOT
         ).decode('utf-8').strip()
-        
+
         # Check if working directory is dirty
         dirty = subprocess.call(
             ['git', 'diff-index', '--quiet', 'HEAD', '--'],
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            cwd=APP_ROOT
         ) != 0
-        
+
         if dirty:
             commit += '-dirty'
-            
+
         return commit
     except:
         return 'unknown'
@@ -32,7 +38,7 @@ def get_git_info():
 def get_version_from_file():
     """Read version from app.version file"""
     try:
-        with open('app.version', 'r') as f:
+        with open(os.path.join(APP_ROOT, 'app.version'), 'r') as f:
             return f.read().strip()
     except:
         return '0.1.0'
@@ -47,7 +53,7 @@ def main():
     # Get version info
     version = get_version_from_file()
     git_commit = get_git_info()
-    build_date = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+    build_date = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')
     
     # Generate header content
     header_content = f"""/*
@@ -80,6 +86,7 @@ def main():
     except:
         pass
         
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w') as f:
         f.write(header_content)
     
