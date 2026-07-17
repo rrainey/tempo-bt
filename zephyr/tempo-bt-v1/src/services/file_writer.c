@@ -43,8 +43,17 @@ static struct {
     bool file_open;
     char current_path[256];
 
-    /* Ring buffer for incoming data */
+    /* Ring buffer for incoming data.
+     *
+     * Producers (system workqueue, GNSS thread, main thread) are serialized
+     * by ring_lock; the writer thread is the single unlocked consumer, which
+     * Zephyr's ring_buf supports. Lines are enqueued whole or not at all —
+     * a partial line in the ring corrupts the log stream for downstream
+     * NMEA parsers.
+     */
     struct ring_buf ring;
+    struct k_spinlock ring_lock;
+    uint32_t pending_drops;     /* Lines dropped in the current buffer-full episode */
 
     /* Thread */
     struct k_thread thread;
@@ -169,6 +178,7 @@ int file_writer_open(const char *path)
 
     /* Reset ring buffer */
     ring_buf_reset(&writer.ring);
+    writer.pending_drops = 0;
 
     /* Schedule periodic flush */
     k_work_schedule(&writer.flush_work, K_MSEC(writer.flush_interval_ms));
@@ -178,6 +188,10 @@ int file_writer_open(const char *path)
 
 int file_writer_write(const void *data, size_t len)
 {
+    uint32_t drops_ended = 0;
+    bool new_episode = false;
+    bool dropped = false;
+
     if (!data || len == 0) {
         return -EINVAL;
     }
@@ -186,35 +200,49 @@ int file_writer_write(const void *data, size_t len)
         return -ENOENT;
     }
 
-    /* Try to put data in ring buffer */
-    uint32_t written = ring_buf_put(&writer.ring, data, len);
+    k_spinlock_key_t key = k_spin_lock(&writer.ring_lock);
 
-    if (written < len) {
-        /* Ring buffer full - force immediate flush */
+    if (ring_buf_space_get(&writer.ring) < len) {
+        new_episode = (writer.pending_drops == 0);
+        writer.pending_drops++;
+        dropped = true;
+    } else {
+        drops_ended = writer.pending_drops;
+        writer.pending_drops = 0;
+        ring_buf_put(&writer.ring, data, len);
+    }
+
+    k_spin_unlock(&writer.ring_lock, key);
+
+    if (dropped) {
         k_mutex_lock(&writer.stats_mutex, K_FOREVER);
-        writer.stats.buffer_overflows++;
+        writer.stats.lines_dropped++;
+        if (new_episode) {
+            writer.stats.buffer_overflows++;
+        }
         k_mutex_unlock(&writer.stats_mutex);
 
-        /* Wake writer thread for immediate processing */
+        /* Wake writer thread; the line is gone but drain the backlog */
         k_sem_give(&writer.data_ready);
+        return -ENOSPC;
+    }
 
-        /* Try again after giving thread a chance */
-        k_yield();
-        written += ring_buf_put(&writer.ring, (uint8_t *)data + written, len - written);
-
-        if (written < len) {
-            LOG_WRN("Dropped %zu bytes", len - written);
+    /* Count lines (outside the spinlock; data is already enqueued whole) */
+    uint32_t newlines = 0;
+    const char *p = data;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] == '\n') {
+            newlines++;
         }
     }
 
-    /* Count lines */
-    const char *p = data;
-    for (size_t i = 0; i < written; i++) {
-        if (p[i] == '\n') {
-            k_mutex_lock(&writer.stats_mutex, K_FOREVER);
-            writer.stats.lines_written++;
-            k_mutex_unlock(&writer.stats_mutex);
-        }
+    k_mutex_lock(&writer.stats_mutex, K_FOREVER);
+    writer.stats.lines_written += newlines;
+    k_mutex_unlock(&writer.stats_mutex);
+
+    if (drops_ended > 0) {
+        /* Episode is over — pressure has eased enough to log about it */
+        LOG_WRN("Buffer full: dropped %u lines", drops_ended);
     }
 
     /* Signal writer thread if buffer getting full */
@@ -222,7 +250,7 @@ int file_writer_write(const void *data, size_t len)
         k_sem_give(&writer.data_ready);
     }
 
-    return (written == len) ? 0 : -ENOSPC;
+    return 0;
 }
 
 int file_writer_flush(void)
@@ -271,7 +299,8 @@ int file_writer_close(void)
         LOG_WRN("Write errors: %u", writer.stats.write_errors);
     }
     if (writer.stats.buffer_overflows > 0) {
-        LOG_WRN("Buffer overflows: %u", writer.stats.buffer_overflows);
+        LOG_WRN("Buffer overflows: %u (%u lines dropped)",
+                writer.stats.buffer_overflows, writer.stats.lines_dropped);
     }
 
     return ret;

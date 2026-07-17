@@ -25,7 +25,8 @@ typedef struct {
     uint64_t bytes_written;
     uint32_t flushes;
     uint32_t write_errors;
-    uint32_t buffer_overflows;  /* Times buffer was full */
+    uint32_t buffer_overflows;  /* Buffer-full episodes (consecutive drops count once) */
+    uint32_t lines_dropped;     /* Whole lines discarded because buffer was full */
 } file_writer_stats_t;
 
 /**
