@@ -36,6 +36,15 @@ static bool ble_radio_active;
 /* Storage for dynamic device name */
 static char device_name[32] = "Tempo-BT";  /* Default fallback */
 
+/* Advertising parameters: ~1 s interval to be power/spectrum friendly.
+ * BT_GAP_ADV_SLOW_INT_MIN/MAX are 1000 ms / 1200 ms.
+ */
+static const struct bt_le_adv_param adv_param = BT_LE_ADV_PARAM_INIT(
+    BT_LE_ADV_OPT_CONN,
+    BT_GAP_ADV_SLOW_INT_MIN,
+    BT_GAP_ADV_SLOW_INT_MAX,
+    NULL);
+
 /* BLE advertising data */
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -90,7 +99,7 @@ static void advertising_work_handler(struct k_work *work)
         return;
     }
 
-    int ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, 
+    int ret = bt_le_adv_start(&adv_param, 
                               ad, ARRAY_SIZE(ad), 
                               sd, ARRAY_SIZE(sd));
     if (ret) {
@@ -257,7 +266,7 @@ int ble_mcumgr_init(void)
     /* Start advertising */
     ble_radio_active = true;
 
-    ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
+    ret = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad),
                           sd, ARRAY_SIZE(sd));
     if (ret) {
         LOG_ERR("Failed to start advertising: %d", ret);
@@ -316,7 +325,7 @@ int ble_mcumgr_restart(void)
 
     ble_radio_active = true;
 
-    ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
+    ret = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad),
                           sd, ARRAY_SIZE(sd));
     if (ret && ret != -EALREADY) {
         LOG_ERR("Failed to restart advertising: %d", ret);
